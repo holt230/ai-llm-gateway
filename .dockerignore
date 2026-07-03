@@ -1,0 +1,14 @@
+node_modules
+dist
+.playwright-mcp
+.git
+.agents
+.codex
+backend/data
+backend/gateway.config.json
+backend/test-*.mjs
+.env
+.env.*
+*.log
+.DS_Store
+npm-debug.log*
