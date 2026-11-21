@@ -157,10 +157,10 @@ async function wait(check) {
   }
   throw new Error('Timed out: ' + output);
 }
-function api(path, key, body) {
+function api(path, key, body, headers = {}) {
   return fetch(base + path, {
     method: body ? 'POST' : 'GET',
-    headers: { Authorization: 'Bearer ' + key, 'content-type': 'application/json' },
+    headers: { Authorization: 'Bearer ' + key, 'content-type': 'application/json', ...headers },
     body: body ? JSON.stringify(body) : undefined
   });
 }
@@ -176,6 +176,8 @@ const confirm = (id, receipt, amount = '5.90', key = token) =>
   api('/payments/wechat/confirm', key, { channel: 'wechat', orderId: id, amount, transactionId: receipt });
 const confirmAlipay = (orderId, transactionId, key = legacyToken) =>
   api('/payments/alipay/confirm', key, { orderId, amount: '5.90', transactionId });
+const shortcutConfirm = (channel, key, orderId, amount, transactionId) =>
+  api(`/payments/${channel}/confirm`, key, { channel, orderId, amount, transactionId }, { Accept: 'text/plain' });
 try {
   await start({ AI_GW_ALIPAY_QR_FILE: qrFile, AI_GW_WECHAT_QR_FILE: '' });
   assert.equal((await ok(fetch(base + '/payments/info'))).enabled, false);
@@ -198,10 +200,22 @@ try {
   assert.equal((await confirmAlipay(current.id, alipayReceipt)).status, 409);
   assert.equal((await confirmAlipay('AAAAAAAA0002', alipayReceipt)).status, 409);
   assert.equal((await ok(confirm('AAAAAAAA0001', alipayReceipt))).repeated, true);
-  assert.equal((await ok(confirmAlipay('AAAAAAAA0003', alipayReceipt))).channel, 'alipay');
+  const alipayShortcut = await shortcutConfirm('alipay', legacyToken, 'AAAAAAAA0003', '5.90', alipayReceipt);
+  assert.equal(alipayShortcut.status, 200);
+  assert.match(await alipayShortcut.text(), /入账成功/);
+  assert.equal((await ok(confirmAlipay('AAAAAAAA0003', alipayReceipt))).repeated, true);
   assert.equal((await confirm('AAAAAAAA0002', '2345678901234567', '5.91')).status, 409);
   assert.equal((await ok(confirm('AAAAAAAA0002', '2345678901234567'))).channel, 'wechat');
-  assert.equal((await ok(confirm(current.id, '9345678901234567', '1.23'))).amount, '1.23');
+  const wechatShortcut = await shortcutConfirm('wechat', token, current.id, '1.23', '9345678901234567');
+  assert.equal(wechatShortcut.status, 200);
+  assert.match(wechatShortcut.headers.get('content-type'), /^text\/plain/);
+  assert.match(await wechatShortcut.text(), /入账成功[\s\S]*¥1\.23/);
+  const repeatShortcut = await shortcutConfirm('wechat', token, current.id, '1.23', '9345678901234567');
+  assert.equal(repeatShortcut.status, 200);
+  assert.match(await repeatShortcut.text(), /未重复加余额/);
+  const wrongChannel = await shortcutConfirm('alipay', legacyToken, current.id, '1.23', '9345678901234567');
+  assert.equal(wrongChannel.status, 409);
+  assert.match(await wrongChannel.text(), /本次未入账.*收款渠道/);
   assert.equal((await account('legacy-test-key')).balance, '18.93');
   assert.equal((await api('/v1/responses', alice, { model: 'demo', input: 'hi' })).status, 402);
   const [a, b] = await Promise.all([order(alice), order(bob)]);
@@ -596,15 +610,13 @@ try {
   console.log(
     'WeChat console passed: upload, persistence, pause, deletion, late payments and no double credit'
   );
-  const shortcut = await fetch(base + '/shortcuts/WechatReceipt.shortcut');
-  assert.equal(shortcut.status, 200);
-  assert.match(shortcut.headers.get('content-disposition'), /WechatReceipt\.shortcut/);
-  assert.equal(
-    Buffer.from(await shortcut.arrayBuffer())
-      .subarray(0, 4)
-      .toString(),
-    'AEA1'
-  );
+  for (const name of ['WechatReceipt', 'AlipayReceipt']) {
+    const shortcut = await fetch(base + `/shortcuts/${name}.shortcut`);
+    assert.equal(shortcut.status, 200);
+    assert.equal(shortcut.headers.get('content-disposition'), `attachment; filename="${name}.shortcut"`);
+    assert.equal(shortcut.headers.get('cache-control'), 'no-store');
+    assert.equal(Buffer.from(await shortcut.arrayBuffer()).subarray(0, 4).toString(), 'AEA1');
+  }
   console.log(
     'SaaS tests passed: registration, session persistence, shared user wallet, tenant isolation, model access, suspension, revocation and recovery'
   );

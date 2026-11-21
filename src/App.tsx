@@ -964,7 +964,7 @@ function AppRoutes() {
   if (route === 'console' && identity?.role === 'admin') {
     return (
       <>
-        <ConsolePage user={identity.user} onNavigate={navigate} onSignOut={signOut} />
+        <ConsolePage user={identity.user} publicBaseUrl={publicBaseUrl} onNavigate={navigate} onSignOut={signOut} />
         {feedback}
       </>
     );
@@ -1766,10 +1766,12 @@ function getInitialConsoleView(): ConsoleView {
 
 function ConsolePage({
   user,
+  publicBaseUrl,
   onNavigate,
   onSignOut
 }: {
   user: UserState;
+  publicBaseUrl: string;
   onNavigate: (route: Route) => void;
   onSignOut: () => void;
 }) {
@@ -2114,7 +2116,7 @@ function ConsolePage({
         )}
         {view === 'users' && <UsersAdmin />}
         {view === 'support' && <SupportAdmin request={gatewayRequest} english={!zh} />}
-        {view === 'payments' && <PaymentAdmin base={GATEWAY_BASE_URL} english={language === 'en'} />}
+        {view === 'payments' && <PaymentAdmin base={GATEWAY_BASE_URL} publicBaseUrl={publicBaseUrl} english={language === 'en'} />}
         {view === 'groups' && <GroupsAdmin request={gatewayRequest} t={(chinese, english) => zh ? chinese : english}
           onChannels={() => showView('channels')} renderModels={(group, reloadGroups) => (
             <GroupModelMappings key={group.id} group={group} channels={channels} models={models} serviceApiKey={serviceApiKey}

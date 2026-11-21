@@ -18,7 +18,7 @@ type Order = {
   username?: string | null;
 };
 
-export function PaymentAdmin({ base, english }: { base: string; english: boolean }) {
+export function PaymentAdmin({ base, publicBaseUrl, english }: { base: string; publicBaseUrl: string; english: boolean }) {
   const [channel, setChannel] = useState<'wechat' | 'alipay'>('wechat');
   return (
     <div className="console-stack">
@@ -42,12 +42,12 @@ export function PaymentAdmin({ base, english }: { base: string; english: boolean
           {english ? 'Alipay history' : '支付宝历史订单'}
         </Button>
       </div>
-      <Reconciliation key={channel} base={base} english={english} channel={channel} />
+      <Reconciliation key={channel} base={base} publicBaseUrl={publicBaseUrl} english={english} channel={channel} />
     </div>
   );
 }
 
-function Reconciliation({ base, english, channel }: { base: string; english: boolean; channel: 'wechat' | 'alipay' }) {
+function Reconciliation({ base, publicBaseUrl, english, channel }: { base: string; publicBaseUrl: string; english: boolean; channel: 'wechat' | 'alipay' }) {
   const askConfirmation = useConfirmation();
   const t = (zh: string, en: string) => (english ? en : zh);
   const active = channel === 'wechat';
@@ -471,6 +471,13 @@ function Reconciliation({ base, english, channel }: { base: string; english: boo
                   <code>{active ? 'AI_GW_WECHAT_RECEIPT_TOKEN' : 'AI_GW_ALIPAY_RECEIPT_TOKEN'}</code>
                 </span>
               )}
+            </p>
+            <label className="grid min-w-0 max-w-xl gap-1.5">
+              {t('导入时填写的 HTTPS 核款地址', 'HTTPS confirmation URL for import')}
+              <Input type="url" readOnly value={`${publicBaseUrl}/payments/${channel}/confirm`} onFocus={(event) => event.target.select()} />
+            </label>
+            <p className="m-0 text-muted-foreground">
+              {t('在 iPhone 导入时粘贴上面的地址和本渠道的专用凭证。运行前请在商户账单中核实实收与交易号，再填写网站订单号。', 'When importing on iPhone, paste the URL above and the credential for this channel. Verify the amount and transaction number on the merchant statement before entering the website order ID.')}
             </p>
             <div>
               <Button asChild variant="outline" size="sm">

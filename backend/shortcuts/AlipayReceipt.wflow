@@ -27,7 +27,7 @@
 			<key>ParameterKey</key>
 			<string>WFTextActionText</string>
 			<key>Text</key>
-			<string>填写自己的 HTTPS 网关确认地址，以 /payments/alipay/confirm 结尾</string>
+			<string>从后台「收款管理」复制 HTTPS 核款地址（/payments/alipay/confirm）</string>
 			<key>DefaultValue</key>
 			<string>https://gateway.invalid/payments/alipay/confirm</string>
 		</dict>
@@ -39,9 +39,9 @@
 			<key>ParameterKey</key>
 			<string>WFTextActionText</string>
 			<key>Text</key>
-			<string>填写 Bearer、一个空格和专用收款确认凭证</string>
+			<string>填写 支付宝 专用核款凭证，只填凭证本身</string>
 			<key>DefaultValue</key>
-			<string>Bearer REPLACE_WITH_RECEIPT_TOKEN</string>
+			<string>REPLACE_WITH_RECEIPT_TOKEN</string>
 		</dict>
 	</array>
 	<key>WFWorkflowActions</key>
@@ -63,7 +63,7 @@
 			<key>WFWorkflowActionParameters</key>
 			<dict>
 				<key>WFTextActionText</key>
-				<string>Bearer REPLACE_WITH_RECEIPT_TOKEN</string>
+				<string>REPLACE_WITH_RECEIPT_TOKEN</string>
 				<key>UUID</key>
 				<string>9C889417-A1BE-41F5-A382-CF7119CDC2D9</string>
 			</dict>
@@ -74,7 +74,7 @@
 			<key>WFWorkflowActionParameters</key>
 			<dict>
 				<key>WFAskActionPrompt</key>
-				<string>支付宝付款备注里的网站订单号（12 位）</string>
+				<string>输入用户原来的 12 位网站订单号。支付宝仅用于处理已有的历史订单。</string>
 				<key>WFInputType</key>
 				<string>Text</string>
 				<key>UUID</key>
@@ -87,7 +87,7 @@
 			<key>WFWorkflowActionParameters</key>
 			<dict>
 				<key>WFAskActionPrompt</key>
-				<string>支付宝账单显示的实收人民币金额，例如 5.90</string>
+				<string>按支付宝商户账单填写实收金额（元），例如 5.90。不要填写用户口述金额。</string>
 				<key>WFInputType</key>
 				<string>Text</string>
 				<key>UUID</key>
@@ -100,7 +100,7 @@
 			<key>WFWorkflowActionParameters</key>
 			<dict>
 				<key>WFAskActionPrompt</key>
-				<string>支付宝账单详情中的支付宝交易号，请保留全部数字</string>
+				<string>从支付宝商户账单复制完整支付宝交易号，保留所有数字。</string>
 				<key>WFInputType</key>
 				<string>Text</string>
 				<key>UUID</key>
@@ -113,32 +113,34 @@
 			<key>WFWorkflowActionParameters</key>
 			<dict>
 				<key>WFAlertActionTitle</key>
-				<string>确认已在支付宝账单看到这笔款？</string>
+				<string>确认这笔历史支付宝收款？</string>
 				<key>WFAlertActionMessage</key>
 				<dict>
 					<key>Value</key>
 					<dict>
 						<key>string</key>
-						<string>订单 ￼
-实收 ¥￼
-支付宝交易号 ￼</string>
+						<string>网站订单：￼
+账单实收：¥￼
+支付宝交易号：￼
+
+确认后将为该订单入账。</string>
 						<key>attachmentsByRange</key>
 						<dict>
-							<key>{3, 1}</key>
+							<key>{5, 1}</key>
 							<dict>
 								<key>Type</key>
 								<string>ActionOutput</string>
 								<key>OutputUUID</key>
 								<string>672E8D80-C62D-47E3-9390-CAAC9FA940AE</string>
 							</dict>
-							<key>{9, 1}</key>
+							<key>{13, 1}</key>
 							<dict>
 								<key>Type</key>
 								<string>ActionOutput</string>
 								<key>OutputUUID</key>
 								<string>FE617731-9513-4AEC-BC2C-57A4AC48EB60</string>
 							</dict>
-							<key>{18, 1}</key>
+							<key>{22, 1}</key>
 							<dict>
 								<key>Type</key>
 								<string>ActionOutput</string>
@@ -208,7 +210,7 @@
 									<dict>
 										<key>attachmentsByRange</key>
 										<dict>
-											<key>{0, 1}</key>
+											<key>{7, 1}</key>
 											<dict>
 												<key>Type</key>
 												<string>ActionOutput</string>
@@ -217,7 +219,31 @@
 											</dict>
 										</dict>
 										<key>string</key>
-										<string>￼</string>
+										<string>Bearer ￼</string>
+									</dict>
+									<key>WFSerializationType</key>
+									<string>WFTextTokenString</string>
+								</dict>
+							</dict>
+							<dict>
+								<key>WFItemType</key>
+								<integer>0</integer>
+								<key>WFKey</key>
+								<dict>
+									<key>Value</key>
+									<dict>
+										<key>string</key>
+										<string>Accept</string>
+									</dict>
+									<key>WFSerializationType</key>
+									<string>WFTextTokenString</string>
+								</dict>
+								<key>WFValue</key>
+								<dict>
+									<key>Value</key>
+									<dict>
+										<key>string</key>
+										<string>text/plain</string>
 									</dict>
 									<key>WFSerializationType</key>
 									<string>WFTextTokenString</string>

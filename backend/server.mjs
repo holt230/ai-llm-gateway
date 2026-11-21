@@ -4774,14 +4774,24 @@ async function handlePayments(req, res, path, searchParams) {
     // Previously installed WeChat shortcuts use the unqualified endpoint.
     const channel = path === '/payments/alipay/confirm' ? 'alipay' : 'wechat';
     const expectedToken = channel === 'wechat' ? wechatReceiptToken : receiptToken;
-    const credential = extractCredential(req);
-    if (expectedToken.length < 32 || !credential.ok || !safeTextEqual(credential.token, expectedToken)) {
-      throw httpError(403, '收款确认凭证无效');
+    const asText = req.headers.accept === 'text/plain';
+    res.setHeader('cache-control', 'no-store');
+    try {
+      const credential = extractCredential(req);
+      if (expectedToken.length < 32 || !credential.ok || !safeTextEqual(credential.token, expectedToken)) {
+        throw httpError(403, '收款确认凭证无效');
+      }
+      const body = await readJsonBody(req);
+      if (body?.channel !== undefined && body.channel !== channel) throw httpError(400, '收款渠道与核款入口不符');
+      const result = await (await walletStore()).confirm(channel, body || {});
+      if (asText) {
+        const status = result.repeated ? '此前已入账，本次未重复加余额' : '入账成功，余额已更新';
+        sendText(res, 200, `${status}\n网站订单：${result.orderId}\n实收：¥${result.amount}`);
+      } else sendJson(res, 200, result);
+    } catch (error) {
+      if (!asText || !(error.status >= 400 && error.status < 500)) throw error;
+      sendText(res, error.status, `本次未入账：${error.message}`);
     }
-    const body = await readJsonBody(req);
-    if (body?.channel !== undefined && body.channel !== channel) throw httpError(400, '收款渠道与核款入口不符');
-    const result = await (await walletStore()).confirm(channel, body || {});
-    sendJson(res, 200, result);
     return;
   }
   if (path.startsWith('/payments/orders/') && req.method === 'DELETE') {
@@ -4831,7 +4841,7 @@ async function routeRequest(req, res) {
       try {
         const { size } = await stat(file);
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': size,
-          'content-disposition': 'attachment; filename="' + name + '.shortcut"' });
+          'cache-control': 'no-store', 'content-disposition': 'attachment; filename="' + name + '.shortcut"' });
         res.end(req.method === 'HEAD' ? undefined : await readFile(file));
         return;
       } catch {
