@@ -14,7 +14,9 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const configPath = join(tempDir, 'gateway.config.json');
 const requestLogPath = join(tempDir, 'requests.jsonl');
 const auditLogPath = join(tempDir, 'audit.jsonl');
+const adminKey = 'gateway-test-admin-key';
 const upstreamRequests = [];
+let upstreamDisconnections = 0;
 const upstreamServer = createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) {
@@ -27,6 +29,43 @@ const upstreamServer = createServer(async (req, res) => {
     headers: req.headers,
     body
   });
+
+  if (req.url === '/v1/models') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [
+      { id: 'gpt-6.2-sol' }, { id: 'gpt-6.2-astra' }, { id: 'vendor/other' }, { id: 'gpt-6.2-sol' }
+    ] }));
+    return;
+  }
+
+  if (req.url === '/v1/responses') {
+    const { input } = JSON.parse(body.toString('utf8'));
+    if (input === 'redirect') {
+      res.writeHead(307, { location: '/unexpected-redirect' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'public, max-age=3600' });
+    if (input === 'disconnect' || input === 'interrupt') {
+      res.once('close', () => { upstreamDisconnections += 1; });
+      res.write('data: {"type":"response.created"}\n\n');
+      if (input === 'interrupt') {
+        await delay(20);
+        res.destroy();
+      }
+      return;
+    }
+    const event = Buffer.from('event: response.output_text.delta\r\ndata: {"delta":"你好"}\r\n\r\n');
+    const split = event.indexOf(Buffer.from('你')) + 1;
+    res.write(event.subarray(0, split));
+    await delay(15);
+    res.write(event.subarray(split, -2));
+    await delay(15);
+    res.write(event.subarray(-2));
+    await delay(15);
+    res.end('event: response.completed\ndata: {"response":{\ndata: "model":"upstream-stream-model","usage":{"input_tokens":10,"output_tokens":5}}}\n\n');
+    return;
+  }
 
   if (req.url?.includes('/audio/speech')) {
     res.writeHead(200, {
@@ -67,10 +106,11 @@ const config = {
   publicBaseUrl: 'https://ai-gw.jetlinks.cn',
   auth: {
     internalApiKeys: [
+      { id: 'admin-dev', key: 'dev-internal-key', role: 'admin' },
       {
-        id: 'admin-dev',
-        name: 'Development Admin',
-        key: 'dev-internal-key',
+        id: 'admin-test',
+        name: 'Gateway Test Admin',
+        key: adminKey,
         role: 'admin',
         enabled: true,
         perMinute: 1000,
@@ -141,6 +181,12 @@ const config = {
       upstreamModel: 'tts-1-hd',
       enabled: true,
       endpoints: ['audio']
+    },
+    'jetlink-stream': {
+      provider: 'localMultimodal',
+      upstreamModel: 'upstream-stream-model',
+      endpoints: ['responses'],
+      fallbacks: [{ provider: 'mock', upstreamModel: 'mock-backup' }]
     }
   },
   routing: {
@@ -151,6 +197,7 @@ const config = {
   pricing: {
     currency: 'USD',
     models: {
+      'jetlink-stream': { inputPerMillionTokens: 10, outputPerMillionTokens: 20 },
       'jetlink-chat': {
         inputPerMillionTokens: 1,
         outputPerMillionTokens: 2
@@ -213,9 +260,11 @@ try {
   const ready = await json('/ready');
   assert.equal(ready.ok, true);
   assert.deepEqual(Object.keys(ready), ['ok']);
+  const legacyAdminKey = await raw('/admin/models', { apiKey: 'dev-internal-key' });
+  assert.equal(legacyAdminKey.status, 401);
 
   const models = await json('/v1/models', { apiKey: 'dev-service-key' });
-  assert.deepEqual(models.data.map((item) => item.id).sort(), ['jetlink-chat', 'jetlink-embedding']);
+  assert.deepEqual(models.data.map((item) => item.id).sort(), ['jetlink-chat', 'jetlink-embedding', 'jetlink-stream']);
   const serializedModels = JSON.stringify(models);
   assert.equal(serializedModels.includes('provider'), false);
   assert.equal(serializedModels.includes('upstream_model'), false);
@@ -232,16 +281,16 @@ try {
   assert.equal(chat.upstream_model, undefined);
   assert.equal(JSON.stringify(chat).includes('gpt-4.1-mini'), false);
 
-  const usageAfterChat = await json('/admin/usage', { apiKey: 'dev-internal-key' });
+  const usageAfterChat = await json('/admin/usage', { apiKey: adminKey });
   assert.ok(usageAfterChat.data.tokens.total >= 24);
   assert.ok(usageAfterChat.data.estimatedCost.USD > 0);
 
   await json('/v1/images/generations', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'POST',
     body: { model: 'jetlink-image', prompt: 'billing test', n: 3 }
   });
-  const usageAfterImage = await json('/admin/usage', { apiKey: 'dev-internal-key' });
+  const usageAfterImage = await json('/admin/usage', { apiKey: adminKey });
   assert.equal(usageAfterImage.data.billable.images, 3);
   assert.equal(usageAfterImage.data.estimatedCost.CNY, 1.5);
 
@@ -251,7 +300,7 @@ try {
   imageEditForm.append('n', '1');
   imageEditForm.append('image', new Blob([Buffer.from('fake image')], { type: 'image/png' }), 'input.png');
   const imageEdit = await raw('/v1/images/edits', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'POST',
     formData: imageEditForm
   });
@@ -277,7 +326,7 @@ try {
   assert.equal(upstreamImage.size, 10);
 
   const audioSpeech = await raw('/v1/audio/speech', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'POST',
     body: { model: 'jetlink-audio', input: 'hello', voice: 'alloy' }
   });
@@ -291,12 +340,12 @@ try {
   assert.equal(audioUpstream.headers.authorization, 'Bearer sk-local-upstream');
   assert.equal(JSON.parse(audioUpstream.body.toString('utf8')).model, 'tts-1-hd');
 
-  const pricing = await json('/admin/pricing', { apiKey: 'dev-internal-key' });
+  const pricing = await json('/admin/pricing', { apiKey: adminKey });
   assert.equal(pricing.data.models['jetlink-chat'].outputPerMillionTokens, 2);
   assert.equal(pricing.data.models['jetlink-image'].billingUnit, 'image');
 
   await json('/admin/models/tmp-rename-source', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'PUT',
     body: {
       provider: 'mock',
@@ -306,12 +355,12 @@ try {
     }
   });
   await json('/admin/routing', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'PUT',
     body: { defaultModel: 'tmp-rename-source' }
   });
   const renameScoped = await json('/admin/api-keys', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'POST',
     body: {
       id: 'rename-scoped',
@@ -322,10 +371,10 @@ try {
       allowedEndpoints: ['chat']
     }
   });
-  const renameScopedSecret = await json('/admin/api-keys/rename-scoped/secret', { apiKey: 'dev-internal-key' });
+  const renameScopedSecret = await json('/admin/api-keys/rename-scoped/secret', { apiKey: adminKey });
   assert.equal(renameScopedSecret.secret, renameScoped.secret);
   await json('/admin/pricing', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'PUT',
     body: {
       ...pricing.data,
@@ -339,7 +388,7 @@ try {
     }
   });
   const renamedModel = await json('/admin/models/tmp-rename-target', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'PUT',
     body: {
       previousAlias: 'tmp-rename-source',
@@ -354,24 +403,24 @@ try {
   assert.equal(renamedModel.movedReferences.apiKeysUpdated, 1);
   assert.equal(renamedModel.movedReferences.pricingMoved, true);
 
-  const routingAfterRename = await json('/admin/routing', { apiKey: 'dev-internal-key' });
+  const routingAfterRename = await json('/admin/routing', { apiKey: adminKey });
   assert.equal(routingAfterRename.data.defaultModel, 'tmp-rename-target');
-  const pricingAfterRename = await json('/admin/pricing', { apiKey: 'dev-internal-key' });
+  const pricingAfterRename = await json('/admin/pricing', { apiKey: adminKey });
   assert.equal(pricingAfterRename.data.models['tmp-rename-source'], undefined);
   assert.equal(pricingAfterRename.data.models['tmp-rename-target'].outputPerMillionTokens, 4);
   const scopedModelsAfterRename = await json('/v1/models', { apiKey: renameScoped.secret });
   assert.deepEqual(scopedModelsAfterRename.data.map((item) => item.id), ['tmp-rename-target']);
   const deleteReferencedModel = await raw('/admin/models/tmp-rename-target', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'DELETE'
   });
   assert.equal(deleteReferencedModel.status, 409);
 
-  const limits = await json('/admin/limits', { apiKey: 'dev-internal-key' });
+  const limits = await json('/admin/limits', { apiKey: adminKey });
   assert.equal(limits.data.maxInFlightPerApiKey, 1);
 
   const directSecretProvider = await json('/admin/providers/direct-secret-check', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'PUT',
     body: {
       name: 'Direct Secret Provider',
@@ -386,17 +435,17 @@ try {
   assert.equal(directSecretProvider.provider.apiKey, undefined);
   assert.equal(directSecretProvider.provider.apiKeyPreview, 'sk-tes...cret');
 
-  const directSecretHealth = await json('/admin/providers/direct-secret-check/health', { apiKey: 'dev-internal-key' });
+  const directSecretHealth = await json('/admin/providers/direct-secret-check/health', { apiKey: adminKey });
   assert.equal(directSecretHealth.configured, true);
   assert.equal(directSecretHealth.ok, true);
 
   await json('/admin/providers/direct-secret-check', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'DELETE'
   });
 
   const restricted = await json('/admin/api-keys', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'POST',
     body: {
       id: 'restricted-embedding',
@@ -420,7 +469,7 @@ try {
   assert.equal(forbidden.status, 403);
 
   await json('/admin/models/tmp-failover-check', {
-    apiKey: 'dev-internal-key',
+    apiKey: adminKey,
     method: 'PUT',
     body: {
       routes: [
@@ -446,15 +495,15 @@ try {
   assert.equal(failoverBody.model, 'tmp-failover-check');
   assert.equal(JSON.stringify(failoverBody).includes('fallback-mock'), false);
 
-  const validation = await json('/admin/config/validate', { apiKey: 'dev-internal-key' });
+  const validation = await json('/admin/config/validate', { apiKey: adminKey });
   assert.equal(validation.ok, true);
   assert.ok(validation.warnings.some((item) => item.code === 'provider_secret_missing'));
 
-  const diagnostics = await json('/admin/diagnostics', { apiKey: 'dev-internal-key' });
+  const diagnostics = await json('/admin/diagnostics', { apiKey: adminKey });
   assert.equal(diagnostics.validation.ok, true);
   assert.ok(diagnostics.usage.total >= 3);
 
-  const usage = await json('/admin/usage', { apiKey: 'dev-internal-key' });
+  const usage = await json('/admin/usage', { apiKey: adminKey });
   assert.ok(usage.data.byApiKey['service-demo'] >= 1);
   assert.ok(usage.data.byEndpoint['/v1/chat/completions'] >= 1);
   assert.ok(usage.data.failoverRequests >= 1);
@@ -475,9 +524,133 @@ try {
   assert.equal(overLimit.status, 429);
   await stream.text();
 
-  const concurrency = await json('/admin/concurrency', { apiKey: 'dev-internal-key' });
+  const concurrency = await json('/admin/concurrency', { apiKey: adminKey });
   assert.ok(concurrency.data.rejected >= 1);
 
+  // The admin session is accepted at the gateway and stripped before forwarding.
+  const login = await raw('/admin/session', {
+    method: 'POST',
+    body: { username: 'admin', password: 'Gateway-Test-Password-2026' }
+  });
+  assert.equal(login.status, 200);
+  const sessionCookie = login.headers.get('set-cookie').split(';')[0];
+  const streamed = await raw('/v1/responses', {
+    method: 'POST',
+    headers: { cookie: sessionCookie, accept: 'text/event-stream', 'x-openai-client-secret': 'client-only' },
+    body: { model: 'jetlink-stream', input: 'Hello', stream: true }
+  });
+  assert.equal(streamed.status, 200);
+  assert.equal(streamed.headers.get('cache-control'), 'no-store');
+  assert.equal(streamed.headers.get('x-accel-buffering'), 'no');
+  const streamedText = await streamed.text();
+  assert.match(streamedText, /data: {"delta":"你好"}\n\nevent: response.completed/);
+  assert.match(streamedText, /"model":"jetlink-stream"/);
+  assert.equal(streamedText.includes('upstream-stream-model'), false);
+  const streamedUpstream = upstreamRequests.find((item) => item.url === '/v1/responses');
+  assert.equal(streamedUpstream.headers.cookie, undefined);
+  assert.equal(streamedUpstream.headers['x-openai-client-secret'], undefined);
+  assert.equal(streamedUpstream.headers.authorization, 'Bearer sk-local-upstream');
+  assert.equal(streamedUpstream.headers.accept, 'text/event-stream');
+
+  const streamLog = await waitForRequestLog(streamed.headers.get('x-request-id'));
+  assert.deepEqual(streamLog.usage, { inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+  assert.equal(streamLog.estimatedCost.totalCost, 0.0002);
+  const newPricing = (await json('/admin/pricing', { apiKey: adminKey })).data;
+  newPricing.models['jetlink-stream'].inputPerMillionTokens = 100;
+  await json('/admin/pricing', { apiKey: adminKey, method: 'PUT', body: newPricing });
+  const historicalLog = await waitForRequestLog(streamed.headers.get('x-request-id'));
+  assert.equal(historicalLog.estimatedCost.totalCost, 0.0002);
+
+  const redirected = await raw('/v1/responses', {
+    apiKey: 'dev-service-key',
+    method: 'POST',
+    body: { model: 'jetlink-stream', input: 'redirect' }
+  });
+  assert.equal(redirected.status, 200);
+  await redirected.json();
+  const redirectLog = await waitForRequestLog(redirected.headers.get('x-request-id'));
+  assert.deepEqual(redirectLog.attempts.map((attempt) => attempt.status), [502, 200]);
+  assert.equal(upstreamRequests.some((request) => request.url === '/unexpected-redirect'), false);
+
+  const interrupted = await raw('/v1/responses', {
+    apiKey: 'dev-service-key',
+    method: 'POST',
+    body: { model: 'jetlink-stream', input: 'interrupt', stream: true }
+  });
+  await assert.rejects(interrupted.text());
+  const interruptedLog = await waitForRequestLog(interrupted.headers.get('x-request-id'));
+  assert.equal(interruptedLog.status, 502);
+  assert.equal(interruptedLog.attempts.length, 1);
+
+  await json('/admin/limits', {
+    apiKey: adminKey,
+    method: 'PUT',
+    body: { maxQueuedRequests: 10, queueTimeoutMs: 5000 }
+  });
+  const abort = new AbortController();
+  const pending = await raw('/v1/responses', {
+    apiKey: 'dev-service-key',
+    method: 'POST',
+    signal: abort.signal,
+    body: { model: 'jetlink-stream', input: 'disconnect', stream: true }
+  });
+  const queuedAbort = new AbortController();
+  const queued = assert.rejects(raw('/v1/responses', {
+    apiKey: 'dev-service-key',
+    method: 'POST',
+    signal: queuedAbort.signal,
+    headers: { 'x-request-id': 'queued-disconnect' },
+    body: { model: 'jetlink-stream', input: 'queued', stream: true }
+  }), { name: 'AbortError' });
+  await waitFor(async () => {
+    const result = await json('/admin/concurrency', { apiKey: adminKey });
+    return result.data.queueLength === 1;
+  }, 'queued request');
+  queuedAbort.abort();
+  await queued;
+  const queuedLog = await waitForRequestLog('queued-disconnect');
+  assert.equal(queuedLog.status, 499);
+  assert.equal(queuedLog.attempts.length, 0);
+  abort.abort();
+  const cancelledLog = await waitForRequestLog(pending.headers.get('x-request-id'));
+  assert.equal(cancelledLog.status, 499);
+  assert.equal(cancelledLog.attempts.length, 1);
+  await waitFor(() => upstreamDisconnections === 2, 'upstream cancellation');
+
+  await json('/admin/routing', {
+    apiKey: adminKey,
+    method: 'PUT',
+    body: { defaultModel: 'jetlink-embedding' }
+  });
+  assert.deepEqual(await json('/ready'), { ok: true });
+  const referencedFallback = await raw('/admin/providers/mock', { apiKey: adminKey, method: 'DELETE' });
+  assert.equal(referencedFallback.status, 409);
+  assert.match((await referencedFallback.json()).error, /jetlink-stream/);
+
+  const discoveryPath = '/admin/providers/localMultimodal/models';
+  const adminOptions = { apiKey: adminKey };
+  assert.equal((await raw(discoveryPath, { apiKey: 'dev-service-key' })).status, 403);
+  const discovered = (await json(discoveryPath, adminOptions)).data;
+  assert.deepEqual(discovered.map(row => row.id), ['gpt-6.2-sol', 'gpt-6.2-astra', 'vendor/other']);
+  assert.equal(discovered.find(row => row.id === 'vendor/other').billing, null);
+  const modelImport = { ...adminOptions, method: 'POST', body: {
+    ids: discovered.map(row => row.id), endpoints: ['responses'], publish: true
+  } };
+  const imported = (await json(discoveryPath, modelImport)).data;
+  assert.deepEqual(imported.map(row => row.status), ['published','published','internal']);
+  assert.match(imported[2].alias, /^[a-zA-Z0-9][a-zA-Z0-9._:-]+$/);
+  assert.ok((await json(discoveryPath, modelImport)).data.every(row => row.status === 'existing'));
+  assert.equal((await raw(discoveryPath, { ...modelImport, body: { ...modelImport.body, ids: ['not-on-upstream'] } })).status, 409);
+  assert.equal((await raw('/v1/codex/models')).status, 401);
+  const scoped = await json('/admin/api-keys', { ...adminOptions, method:'POST',body:{
+    id:'codex-catalog-check', role:'service', allowedModels:['gpt-6.2-sol'], allowedEndpoints:['responses']
+  } });
+  const catalog = await json('/v1/codex/models?client_version=0.169.0', { apiKey: scoped.secret });
+  assert.deepEqual(catalog.models.map(model => model.slug), ['gpt-6.2-sol']);
+  assert.equal(catalog.models[0].supported_in_api, true);
+  assert.equal(catalog.models[0].visibility, 'list');
+  assert.ok((await json('/v1/codex/models', adminOptions)).models.some(model => model.slug === 'gpt-6.2-astra'));
+  console.log('Model import, collisions-safe aliases and authenticated Codex catalog passed');
   console.log('backend integration tests passed');
 } finally {
   child.kill('SIGTERM');
@@ -514,6 +687,23 @@ async function json(path, options = {}) {
   return payload;
 }
 
+async function waitFor(predicate, description) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const result = await predicate();
+    if (result) return result;
+    await delay(25);
+  }
+  assert.fail(`Timed out waiting for ${description}`);
+}
+
+function waitForRequestLog(requestId) {
+  return waitFor(async () => {
+    const { data } = await json('/admin/requests', { apiKey: adminKey });
+    return data.find((entry) => entry.requestId === requestId);
+  }, `request log ${requestId}`);
+}
+
 async function raw(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.apiKey) {
@@ -529,7 +719,8 @@ async function raw(path, options = {}) {
   return fetch(`${baseUrl}${path}`, {
     method: options.method || 'GET',
     headers,
-    body
+    body,
+    signal: options.signal
   });
 }
 

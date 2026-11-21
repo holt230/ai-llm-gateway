@@ -3,8 +3,15 @@ import { stat, readFile, writeFile, mkdir, appendFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import pg from 'pg';
+import { CNY_PRICES, OPENAI_STANDARD_REFERENCE, PRICE_DATE, normalizeCnyPrice, parseYuan, prepaidBudget, standardApiDiscount, usageCharge } from './cny-prices.mjs';
+import { CHECKOUT_CHANNEL, openWalletStore } from './manual-wallet.mjs';
+import { supportSessionTtl } from './accounts.mjs';
+
+const SUPPORT_COOKIE = 'jl_support';
 
 const { Pool } = pg;
 
@@ -51,8 +58,8 @@ const ADMIN_SESSION_RATE_LIMIT = Number(aiGwEnv('ADMIN_SESSION_PER_MINUTE') || 6
 const ADMIN_LOGIN_RATE_LIMIT = Number(aiGwEnv('ADMIN_LOGIN_PER_MINUTE') || 10);
 const SUPER_ADMIN_USERNAME = envValue('AI_GW_SUPER_ADMIN_USERNAME', 'VITE_AI_GW_SUPER_ADMIN_USERNAME') || 'admin';
 const SUPER_ADMIN_NAME = envValue('AI_GW_SUPER_ADMIN_NAME', 'VITE_AI_GW_SUPER_ADMIN_NAME') || '超级管理员';
-const SUPER_ADMIN_PASSWORD = envValue('AI_GW_SUPER_ADMIN_PASSWORD', 'VITE_AI_GW_SUPER_ADMIN_PASSWORD');
-const DEFAULT_PUBLIC_BASE_URL = 'https://ai-gw.jetlinks.cn';
+const SUPER_ADMIN_PASSWORD = aiGwEnv('SUPER_ADMIN_PASSWORD');
+const DEFAULT_PUBLIC_BASE_URL = 'https://1024012.xyz';
 
 if (!['file', 'postgres'].includes(STORAGE_DRIVER)) {
   throw new Error('AI_GW_PERSISTENCE must be "file" or "postgres".');
@@ -71,22 +78,9 @@ const postgresPool = STORAGE_DRIVER === 'postgres'
   })
   : null;
 
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection',
-  'content-encoding',
-  'content-length',
-  'host',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade'
-]);
+const UPSTREAM_CLIENT_HEADERS = ['accept', 'openai-beta', 'anthropic-version', 'anthropic-beta'];
 
 const PUBLIC_UPSTREAM_RESPONSE_HEADERS = new Set([
-  'cache-control',
   'content-disposition',
   'content-type'
 ]);
@@ -97,6 +91,7 @@ const DEFAULT_MAX_MULTIPART_PARTS = 128;
 const DEFAULT_MAX_MULTIPART_FILES = 32;
 
 const STATIC_MIME_TYPES = {
+  '.shortcut': 'application/octet-stream',
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -142,6 +137,73 @@ const concurrencyState = {
   shuttingDown: false
 };
 
+const receiptToken = aiGwEnv('ALIPAY_RECEIPT_TOKEN');
+const wechatReceiptToken = aiGwEnv('WECHAT_RECEIPT_TOKEN');
+const qrFiles = { alipay: aiGwEnv('ALIPAY_QR_FILE'), wechat: aiGwEnv('WECHAT_QR_FILE') };
+const walletFile = aiGwEnv('WALLET_FILE') || resolve(DATA_DIR, 'wallet.sqlite');
+const maxQrBytes = 4 * 1024 * 1024;
+function paymentQr(bytes) {
+  if (bytes.length > maxQrBytes) throw httpError(413, '收款码图片超过 4 MB');
+  const png = bytes.length >= 33 && bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a','hex'))
+    && bytes.toString('ascii', 12, 16) === 'IHDR';
+  const jpeg = bytes.length > 4 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+  if (!png && !jpeg) throw httpError(400, '请上传 PNG 或 JPEG 收款码图片');
+  return {bytes, type: png ? 'image/png' : 'image/jpeg'};
+}
+const paymentImages = {};
+for (const [channel, path] of Object.entries(qrFiles)) {
+  if (!path) continue;
+  if ((await stat(path)).size > maxQrBytes) throw new Error('收款码图片超过 4 MB');
+  paymentImages[channel] = paymentQr(await readFile(path));
+}
+
+let userKeySecret;
+async function loadUserKeySecret() {
+  const configured = aiGwEnv('USER_KEY_SECRET');
+  if (configured) return createHash('sha256').update(configured).digest();
+  const path = walletFile + '.key';
+  try {
+    return await readFile(path);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  await mkdir(dirname(path), { recursive: true });
+  const key = randomBytes(32);
+  try {
+    await writeFile(path, key, { flag: 'wx', mode: 0o600 });
+    return key;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    return readFile(path);
+  }
+}
+async function getUserKeySecret() {
+  userKeySecret ??= loadUserKeySecret().then(key => {
+    if (key.length !== 32) throw new Error('Invalid wallet key encryption configuration');
+    return key;
+  }).catch(error => {
+    userKeySecret = undefined;
+    throw error;
+  });
+  return userKeySecret;
+}
+const userKeyCodec = {
+  seal: async value => encryptSecret(value, await getUserKeySecret()),
+  open: async value => decryptSecret(value, await getUserKeySecret())
+};
+
+let walletPromise;
+function walletStore() {
+  walletPromise ??= openWalletStore(postgresPool, walletFile, POSTGRES_CONFIG_ID, userKeyCodec).catch((error) => {
+    walletPromise = undefined;
+    throw error;
+  });
+  return walletPromise;
+}
+
+let pendingConfigSave = Promise.resolve();
+const deletingGroups = new Set();
+const deletingCnyPrices = new Set();
 let configState = await loadConfig();
 let config = configState.config;
 await ensureSuperAdminPasswordPersisted();
@@ -157,22 +219,12 @@ function defaultConfig() {
         username: SUPER_ADMIN_USERNAME,
         name: SUPER_ADMIN_NAME
       },
-      internalApiKeys: [
-        {
-          id: 'admin-dev',
-          name: 'System Admin',
-          key: 'dev-internal-key',
-          role: 'admin',
-          system: true,
-          enabled: true,
-          perMinute: 120,
-          allowedModels: ['*'],
-          allowedEndpoints: ['*']
-        }
-      ]
+      internalApiKeys: []
     },
     providers: {},
     models: {},
+    modelGroups: {},
+    cnyPricing: { version: PRICE_DATE, prices: {} },
     routing: {
       defaultModel: '',
       failoverStatusCodes: DEFAULT_FAILOVER_STATUS_CODES,
@@ -339,14 +391,14 @@ function normalizeConfig(input) {
     limits: normalizeLimitsConfig({ ...base.limits, ...(input.limits || {}) }),
     security: normalizeSecurityConfig({ ...base.security, ...(input.security || {}) })
   };
-  let keys = (next.auth.internalApiKeys || []).map((key) => ({
-    ...normalizeStoredInternalKey(key),
-    allowedModels: normalizeAccessList(key.allowedModels, ['*'], 'allowedModels'),
-    allowedEndpoints: normalizeEndpoints(key.allowedEndpoints, ['*'])
-  }));
-  if (process.env.AI_GW_DISABLE_DEV_KEYS === 'true') {
-    keys = keys.filter((key) => key.id !== 'admin-dev');
-  }
+  // Ignore the built-in development key saved by older installations.
+  let keys = (next.auth.internalApiKeys || [])
+    .filter((key) => key.id !== 'admin-dev')
+    .map((key) => ({
+      ...normalizeStoredInternalKey(key),
+      allowedModels: normalizeAccessList(key.allowedModels, ['*'], 'allowedModels'),
+      allowedEndpoints: normalizeEndpoints(key.allowedEndpoints, ['*'])
+    }));
   const bootstrapAdminKey = process.env.AI_GW_BOOTSTRAP_ADMIN_KEY;
   if (bootstrapAdminKey) {
     const existing = keys.find((key) => key.id === 'bootstrap-admin');
@@ -402,8 +454,26 @@ async function ensureSuperAdminPasswordPersisted() {
   }
 }
 
-async function saveConfig() {
-  const serializable = serializeConfigForDisk(config);
+function queueConfigSave(write) {
+  const saved = pendingConfigSave.then(write);
+  pendingConfigSave = saved.catch(() => {});
+  return saved;
+}
+
+function saveConfig() {
+  return queueConfigSave(() => persistConfig(JSON.stringify(serializeConfigForDisk(config), null, 2)));
+}
+
+function saveOperationsConfig(field, update) {
+  return queueConfigSave(async () => {
+    const value = await update(config[field]);
+    const next = { ...config, [field]: value };
+    await persistConfig(JSON.stringify(serializeConfigForDisk(next), null, 2));
+    config[field] = value;
+  });
+}
+
+async function persistConfig(snapshot) {
   if (postgresPool) {
     await postgresPool.query(
       `
@@ -412,13 +482,13 @@ async function saveConfig() {
         ON CONFLICT (id)
         DO UPDATE SET config = EXCLUDED.config, updated_at = now()
       `,
-      [POSTGRES_CONFIG_ID, JSON.stringify(serializable)]
+      [POSTGRES_CONFIG_ID, snapshot]
     );
     configState.persistent = true;
     return true;
   }
   await mkdir(dirname(configState.path), { recursive: true });
-  await writeFile(configState.path, `${JSON.stringify(serializable, null, 2)}\n`, 'utf8');
+  await writeFile(configState.path, snapshot + "\n", "utf8");
   configState.persistent = true;
   return true;
 }
@@ -471,7 +541,7 @@ function serializeProviderForDisk(provider) {
 
 function publicRuntimeConfig() {
   return {
-    name: 'JetLinksAPI Gateway',
+    name: 'Wormhole AI Gateway',
     publicBaseUrl: config.publicBaseUrl,
     endpoints: {
       models: '/v1/models',
@@ -565,8 +635,23 @@ function setSecurityHeaders(req, res) {
   }
 }
 
+function accountOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return '';
+  try {
+    const url = new URL(origin);
+    if (url.origin !== origin || !['http:', 'https:'].includes(url.protocol)) return '';
+    if (url.host === req.headers.host || (config.security?.corsOrigins || []).includes(origin)) return origin;
+    if (process.env.NODE_ENV !== 'production' && isLoopbackRequest(req) && ['localhost','127.0.0.1','[::1]'].includes(url.hostname)) return origin;
+  } catch { /* Invalid browser origin. */ }
+  return '';
+}
+
 function setCors(req, res) {
-  const origin = getCorsOrigin(req);
+  const sessionRoute = req.url?.startsWith('/account-api/') || req.url?.startsWith('/admin/');
+  const trustedOrigin = (sessionRoute || req.url?.startsWith('/v1/')) ? accountOrigin(req) : '';
+  const origin = trustedOrigin || (sessionRoute ? '' : getCorsOrigin(req));
+  if (trustedOrigin) res.setHeader('access-control-allow-credentials', 'true');
   if (origin) {
     res.setHeader('access-control-allow-origin', origin);
     res.setHeader('vary', 'Origin');
@@ -881,6 +966,17 @@ function authenticate(req, { admin = false, allowAdminSession = false } = {}) {
   return { ok: true, key };
 }
 
+async function authenticateProxy(req, options = {}) {
+  const credential = extractCredential(req);
+  if (!credential.ok || !credential.token?.startsWith('gw_live_')) return authenticate(req, options);
+  if (options.allowAdminSession && authenticateAdminSession(req).ok) return {ok:false,status:400,error:'Multiple authentication credentials are not allowed.'};
+  const record = await (await walletStore()).accounts.apiKey(credential.token);
+  if (!record) return {ok:false,status:401,error:'Invalid API key.'};
+  const rate = checkRateLimit({id: 'account-' + record.owner, perMinute: 60});
+  if (!rate.ok) return {ok:false,status:429,error:'User rate limit exceeded.'};
+  return {ok:true,key:{id:record.id,accountId:record.owner,username:record.username,modelGroup:record.modelGroup,walletId:'user/'+record.owner,role:'service',prepaid:true}};
+}
+
 function checkRateLimit(key) {
   const limit = Number(key.perMinute || 0);
   if (!limit) {
@@ -897,7 +993,7 @@ function checkRateLimit(key) {
   rateBuckets.set(bucketKey, used + 1);
   if (rateBuckets.size > 5000) {
     for (const existing of rateBuckets.keys()) {
-      const [, bucket] = existing.split(':');
+      const bucket = existing.slice(existing.lastIndexOf(':') + 1);
       if (Number(bucket) < Math.floor(now / windowMs) - 2) {
         rateBuckets.delete(existing);
       }
@@ -906,8 +1002,8 @@ function checkRateLimit(key) {
   return { ok: true };
 }
 
-async function readRawBody(req) {
-  const maxBytes = Number(config.security?.maxBodyBytes || 26_214_400);
+async function readRawBody(req, limit = Infinity) {
+  const maxBytes = Math.min(limit, Number(config.security?.maxBodyBytes || 26_214_400));
   const chunks = [];
   let total = 0;
   for await (const chunk of req) {
@@ -1130,19 +1226,19 @@ function providerSecretEncryptionKey() {
   return createHash('sha256').update(String(PROVIDER_SECRET_KEY)).digest();
 }
 
-function encryptSecret(value) {
+function encryptSecret(value, key = providerSecretEncryptionKey()) {
   const raw = cleanString(value, '');
   if (!raw) {
     return undefined;
   }
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', providerSecretEncryptionKey(), iv);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(raw, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return `v1:${iv.toString('base64url')}:${tag.toString('base64url')}:${encrypted.toString('base64url')}`;
 }
 
-function decryptSecret(value) {
+function decryptSecret(value, key = providerSecretEncryptionKey()) {
   const raw = cleanString(value, '');
   if (!raw) {
     return '';
@@ -1152,7 +1248,7 @@ function decryptSecret(value) {
     if (version !== 'v1' || !ivText || !tagText || !encryptedText) {
       return '';
     }
-    const decipher = createDecipheriv('aes-256-gcm', providerSecretEncryptionKey(), Buffer.from(ivText, 'base64url'));
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivText, 'base64url'));
     decipher.setAuthTag(Buffer.from(tagText, 'base64url'));
     return Buffer.concat([
       decipher.update(Buffer.from(encryptedText, 'base64url')),
@@ -1215,6 +1311,8 @@ function normalizeStoredInternalKey(item = {}) {
     next.keyPreview = next.keyPreview || maskSecret(secret);
     delete next.key;
   }
+  // Keep legacy keys stable across restarts, and preserve the wallet through secret rotation.
+  if (!next.walletId && next.keyHash) next.walletId = createHash('sha256').update(next.id + ':' + next.keyHash).digest('hex');
   return next;
 }
 
@@ -1535,10 +1633,16 @@ function normalizeModelInput(alias, body, existing = {}) {
     upstreamModel: primary.upstreamModel,
     enabled: body.enabled !== undefined ? body.enabled !== false : existing.enabled !== false,
     maxConcurrency: normalizeNonNegativeInteger(body.maxConcurrency, existing.maxConcurrency ?? 0, 'maxConcurrency'),
+    saasEnabled: body.saasEnabled === undefined ? existing.saasEnabled === true : body.saasEnabled === true,
     endpoints: normalizeEndpoints(body.endpoints, existing.endpoints || ['chat'])
   };
   if (fallbacks.length) {
     model.fallbacks = fallbacks;
+  }
+  if (model.saasEnabled) {
+    const priceId = cnyPriceId(alias, model.upstreamModel);
+    if (!priceId) throw httpError(400, '向用户开放模型前，请选择已在售价管理中配置单价的型号');
+    if (model.enabled && deletingCnyPrices.has(priceId)) throw httpError(409, '此售价正在删除，请稍后重试');
   }
   return model;
 }
@@ -1632,8 +1736,18 @@ function normalizeProviderInput(id, body, existing = {}) {
     throw httpError(400, 'Provider type must be mock or openai-compatible.');
   }
 
+  const modelGroup = body.modelGroup === undefined ? existing.modelGroup || 'default' : body.modelGroup;
+  if (typeof modelGroup !== 'string' || !/^[\p{L}\p{N}_. -]{1,48}$/u.test(modelGroup.trim())) {
+    throw httpError(400, '渠道分组名称须为 1–48 位文字、数字、空格、点、短横线或下划线');
+  }
+  const groupId = modelGroup.trim();
+  if (deletingGroups.has(groupId) || (
+    /^grp-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(groupId) &&
+    groupId !== config.providers?.[id]?.modelGroup && !Object.hasOwn(config.modelGroups || {}, groupId)
+  )) throw httpError(409, '所选分组已变更，请刷新分组列表后重试');
   const provider = {
     ...existing,
+    modelGroup: groupId,
     name: cleanString(body.name, existing.name || id),
     type,
     enabled: body.enabled !== undefined ? body.enabled !== false : existing.enabled !== false,
@@ -1722,6 +1836,9 @@ function normalizeInternalApiKeyInput(id, body, existing = {}) {
   const record = {
     ...existingWithoutSecret,
     id,
+    walletId: existing.walletId || randomUUID(),
+    walletManaged: existing.walletManaged === true || existing.prepaid === true || body.prepaid === true,
+    prepaid: role === 'service' && (body.prepaid === undefined ? existing.prepaid === true : body.prepaid === true),
     name: cleanString(body.name, existing.name || id),
     keyHash,
     keyPreview,
@@ -1898,6 +2015,7 @@ function authorizeProxyAccess(key, modelAlias, endpointKind) {
 }
 
 function modelVisibleToKey(key, alias, model) {
+  if (key.accountId && (!model.saasEnabled || !availableRoutes(model,true,key.modelGroup).length)) return false;
   if (key.role === 'admin') {
     return true;
   }
@@ -1907,6 +2025,67 @@ function modelVisibleToKey(key, alias, model) {
   const modelEndpoints = model.endpoints || ['*'];
   const keyEndpoints = key.allowedEndpoints || ['*'];
   return modelEndpoints.includes('*') || keyEndpoints.includes('*') || modelEndpoints.some((endpoint) => keyEndpoints.includes(endpoint));
+}
+
+const PREPAID_PROXY_PATHS = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/embeddings',
+  '/v1/images/generations', '/v1/images/edits', '/v1/images/variations']);
+const DEFAULT_PREPAID_OUTPUT_TOKENS = 4096;
+const MAX_PREPAID_OUTPUT_TOKENS = 32768;
+const PREPAID_MEDIA_TYPES = new Set(['image', 'image_url', 'input_image', 'input_audio', 'audio', 'audio_url', 'video', 'input_video',
+  'file', 'input_file', 'document']);
+
+function prepaidAdmission(tariff, endpointKind, proxyBody) {
+  if (tariff.image) return prepaidBudget(tariff, 0, 0);
+  if (proxyBody.kind !== 'json') throw httpError(422, '预付费 Token 接口暂不支持附件上传');
+  const body = proxyBody.requestBody;
+  if ((Array.isArray(body.modalities) && body.modalities.includes('audio')) || body.audio || accountRequestReferencesSharedResource(body) ||
+    (Array.isArray(body.tools) && body.tools.some(tool => tool?.type && !['function', 'custom'].includes(tool.type)))) {
+    throw httpError(422, '预付费暂不支持无法估算用量的托管工具、音频或外部上下文');
+  }
+  const queue = [body];
+  let frames = 0;
+  while (queue.length) {
+    const value = queue.pop();
+    if (!value || typeof value !== 'object') continue;
+    if (PREPAID_MEDIA_TYPES.has(value.type)) throw httpError(422, '预付费 Token 接口暂不支持图片、音频或文件输入');
+    if (!Array.isArray(value)) frames += 1;
+    for (const child of Object.values(value)) if (child && typeof child === 'object') queue.push(child);
+  }
+
+  let output = 0;
+  if (endpointKind !== 'embeddings') {
+    const field = endpointKind === 'responses' ? 'max_output_tokens'
+      : endpointKind === 'chat' && body.max_tokens === undefined ? 'max_completion_tokens' : 'max_tokens';
+    if (endpointKind === 'chat' && body.max_tokens !== undefined && body.max_completion_tokens !== undefined)
+      throw httpError(400, '请只指定一个输出上限字段');
+    const perChoice = body[field] === undefined ? DEFAULT_PREPAID_OUTPUT_TOKENS : body[field];
+    if (!Number.isSafeInteger(perChoice) || perChoice < 1 || perChoice > MAX_PREPAID_OUTPUT_TOKENS)
+      throw httpError(400, `预付费输出上限需为 1–${MAX_PREPAID_OUTPUT_TOKENS} Token`);
+    const choices = endpointKind === 'chat' && body.n !== undefined ? body.n : 1;
+    if (!Number.isSafeInteger(choices) || choices < 1 || choices * perChoice > MAX_PREPAID_OUTPUT_TOKENS)
+      throw httpError(400, `预付费单次请求的总输出上限不得超过 ${MAX_PREPAID_OUTPUT_TOKENS} Token`);
+    body[field] = perChoice;
+    output = choices * perChoice;
+  }
+  // Quote conservatively from request bytes plus framing. Actual settlement still uses reported usage.
+  const input = Buffer.byteLength(JSON.stringify(body), 'utf8') + 256 + frames * 16;
+  return prepaidBudget(tariff, input, output);
+}
+
+function accountRequestReferencesSharedResource(body) {
+  const queue = [body];
+  while (queue.length) {
+    const value = queue.pop();
+    if (!value || typeof value !== 'object') continue;
+    if (value.file_id || value.file_ids || value.vector_store_ids || value.previous_response_id
+      || value.conversation || value.prompt?.id || value.container || value.background || value.type === 'item_reference'
+      || value.type === 'file_search' || value.type === 'code_interpreter') return true;
+    for (const [key, child] of Object.entries(value)) {
+      if (['parameters', 'input_schema', 'schema', 'metadata'].includes(key)) continue;
+      if (child && typeof child === 'object') queue.push(child);
+    }
+  }
+  return false;
 }
 
 function configuredRouteCandidates(mapping) {
@@ -1956,7 +2135,78 @@ function providerConfigured(provider) {
   return provider?.type === 'mock' || Boolean(provider && upstreamApiKey(provider));
 }
 
-function resolveModel(alias, endpointKind) {
+function availableRoutes(mapping, publicOnly = false, group) {
+  return configuredRouteCandidates(mapping)
+    .map((candidate) => ({
+      ...candidate,
+      providerConfig: config.providers?.[candidate.provider]
+    }))
+    .filter(
+      ({ providerConfig }) =>
+        providerConfig &&
+        providerConfig.enabled !== false &&
+        (!publicOnly || providerConfigured(providerConfig)) &&
+        (group === undefined || (providerConfig.modelGroup || 'default') === group)
+    );
+}
+
+function cnyPrice(id) {
+  const overrides = config.cnyPricing?.prices || {};
+  if (Object.hasOwn(overrides, id)) return overrides[id];
+  return Object.hasOwn(CNY_PRICES, id) ? CNY_PRICES[id] : undefined;
+}
+
+function cnyPriceId(alias, upstreamModel) {
+  return [alias, upstreamModel].find(id => id && cnyPrice(id));
+}
+
+function cnyPrices() {
+  const prices = { ...CNY_PRICES };
+  for (const [id, price] of Object.entries(config.cnyPricing?.prices || {})) {
+    if (price === null) delete prices[id];
+    else prices[id] = price;
+  }
+  return prices;
+}
+
+function publishedCnyPrices(usableOnly = false) {
+  const prices = cnyPrices();
+  for (const [alias, model] of Object.entries(config.models)) {
+    const id = cnyPriceId(alias, model.upstreamModel);
+    if (model.saasEnabled && model.enabled !== false && id) prices[alias] = cnyPrice(id);
+  }
+  if (!usableOnly) return prices;
+  const usable = new Set(publicModelList({ accountId: true, role: 'service' }).map((m) => m.id));
+  const filtered = {};
+  for (const [alias, price] of Object.entries(prices)) {
+    if (usable.has(alias)) filtered[alias] = price;
+  }
+  return filtered;
+}
+
+function managedGroups() {
+  const groups = new Map([['default', { id: 'default', name: null, channels: [], modelCount: 0 }]]);
+  for (const [id, group] of Object.entries(config.modelGroups || {})) {
+    groups.set(id, { id, name: group.name, channels: [], modelCount: 0 });
+  }
+  for (const [id, channel] of Object.entries(config.providers)) {
+    const group = channel.modelGroup || 'default';
+    if (!groups.has(group)) groups.set(group, { id: group, name: group, channels: [], modelCount: 0 });
+    groups.get(group).channels.push({ id, name: channel.name || id });
+  }
+  for (const model of publicModelList({ accountId: true, role: 'service' })) {
+    for (const id of model.groups) groups.get(id).modelCount++;
+  }
+  return [...groups.values()];
+}
+
+function modelGroups(mapping) {
+  return [
+    ...new Set(availableRoutes(mapping, true).map(({ providerConfig }) => providerConfig.modelGroup || 'default'))
+  ].sort();
+}
+
+function resolveModel(alias, endpointKind, accountKey) {
   const modelAlias = alias || config.routing?.defaultModel;
   if (!modelAlias) {
     return { ok: false, status: 400, error: 'Missing model and no default model configured.' };
@@ -1973,12 +2223,7 @@ function resolveModel(alias, endpointKind) {
       error: `Model alias ${modelAlias} does not allow endpoint type ${endpointKind}.`
     };
   }
-  const candidates = configuredRouteCandidates(mapping)
-    .map((candidate) => ({
-      ...candidate,
-      providerConfig: config.providers?.[candidate.provider]
-    }))
-    .filter((candidate) => candidate.providerConfig && candidate.providerConfig.enabled !== false);
+  const candidates = availableRoutes(mapping, Boolean(accountKey), accountKey?.modelGroup);
   if (!candidates.length) {
     return { ok: false, status: 502, error: `Provider unavailable for model alias: ${modelAlias}` };
   }
@@ -1999,28 +2244,23 @@ function buildUpstreamUrl(provider, pathname, search) {
 
 function buildUpstreamHeaders(req, provider, requestId, options = {}) {
   const bodyKind = options.bodyKind || 'json';
-  const headers = {};
-  for (const [name, value] of Object.entries(req.headers)) {
-    const lower = name.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower) || lower === 'authorization' || lower === 'x-api-key' || lower === 'content-type') {
-      continue;
-    }
-    if (Array.isArray(value)) {
-      headers[name] = value.join(', ');
-    } else if (value !== undefined) {
-      headers[name] = value;
+  const headers = new Headers();
+  for (const name of UPSTREAM_CLIENT_HEADERS) {
+    const value = req.headers[name];
+    if (value !== undefined) {
+      headers.set(name, Array.isArray(value) ? value.join(', ') : value);
     }
   }
   if (bodyKind === 'json') {
-    headers['content-type'] = 'application/json';
+    headers.set('content-type', 'application/json');
   }
-  headers['x-request-id'] = requestId;
+  headers.set('x-request-id', requestId);
   const apiKey = upstreamApiKey(provider);
   if (apiKey) {
-    headers.authorization = `Bearer ${apiKey}`;
+    headers.set('authorization', `Bearer ${apiKey}`);
   }
   for (const [name, value] of Object.entries(provider.headers || {})) {
-    headers[name] = value;
+    headers.set(name, value);
   }
   return headers;
 }
@@ -2075,7 +2315,7 @@ function setProxyResponseHeaders(res, upstream, requestId, alias) {
   res.statusCode = upstream.status;
   for (const [name, value] of upstream.headers.entries()) {
     const lower = name.toLowerCase();
-    if (!HOP_BY_HOP_HEADERS.has(lower) && PUBLIC_UPSTREAM_RESPONSE_HEADERS.has(lower)) {
+    if (PUBLIC_UPSTREAM_RESPONSE_HEADERS.has(lower)) {
       res.setHeader(name, value);
     }
   }
@@ -2136,12 +2376,14 @@ function concurrencyError(message, retryAfterSeconds = 1, retryable = false) {
 }
 
 function acquireConcurrency(scopes, meta = {}) {
+  const { signal } = meta;
+  signal?.throwIfAborted();
   const limitedScopes = scopes.filter((scope) => Number(scope.limit || 0) > 0);
-  if (!limitedScopes.length) {
-    return Promise.resolve(() => undefined);
-  }
   if (concurrencyState.shuttingDown) {
     throw httpError(503, 'Gateway is shutting down and not accepting new proxy requests.');
+  }
+  if (!limitedScopes.length) {
+    return Promise.resolve(() => undefined);
   }
   if (canAcquireScopes(limitedScopes)) {
     incrementScopes(limitedScopes);
@@ -2165,22 +2407,29 @@ function acquireConcurrency(scopes, meta = {}) {
   return new Promise((resolve, reject) => {
     const entry = {
       scopes: limitedScopes,
-      meta,
       queuedAt: Date.now(),
       resolve,
-      reject,
-      timer: undefined
-    };
-    entry.timer = setTimeout(() => {
-      const index = concurrencyState.queue.indexOf(entry);
-      if (index !== -1) {
-        concurrencyState.queue.splice(index, 1);
+      cleanup: () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
       }
+    };
+    const removeEntry = () => {
+      concurrencyState.queue.splice(concurrencyState.queue.indexOf(entry), 1);
+      entry.cleanup();
+    };
+    const onAbort = () => {
+      removeEntry();
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      removeEntry();
       concurrencyState.queueTimeouts += 1;
       concurrencyState.rejected += 1;
       reject(concurrencyError('Gateway concurrency queue timeout.', Math.max(1, Math.ceil(queueTimeoutMs / 1000)), Boolean(meta.retryable)));
     }, queueTimeoutMs);
     concurrencyState.queue.push(entry);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -2192,7 +2441,7 @@ function drainConcurrencyQueue() {
     }
     concurrencyState.queue.splice(index, 1);
     index -= 1;
-    clearTimeout(entry.timer);
+    entry.cleanup();
     incrementScopes(entry.scopes);
     let released = false;
     entry.resolve(() => {
@@ -2261,20 +2510,27 @@ function normalizeUsagePayload(usage) {
   if (!isPlainObject(usage)) {
     return undefined;
   }
-  const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.inputTokens ?? 0);
+  if ([usage.prompt_tokens, usage.input_tokens, usage.inputTokens, usage.completion_tokens,
+    usage.output_tokens, usage.outputTokens].every(value => value == null)) return undefined;
+  const read = Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens ?? 0);
+  const write = Number(usage.cache_creation_input_tokens ?? 0);
+  const anthropic = usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined;
+  const countedInput = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.inputTokens ?? 0);
+  const inputTokens = countedInput + (anthropic ? read + write : 0);
   const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? usage.outputTokens ?? 0);
   const totalTokens = Number(usage.total_tokens ?? usage.totalTokens ?? inputTokens + outputTokens);
   if (![inputTokens, outputTokens, totalTokens].every((value) => Number.isFinite(value) && value >= 0)) {
     return undefined;
   }
-  return { inputTokens, outputTokens, totalTokens };
+  return { inputTokens, outputTokens, totalTokens,
+    ...(read ? { cacheReadTokens: read } : {}), ...(write ? { cacheWriteTokens: write } : {}) };
 }
 
 function extractUsageFromPayload(payload) {
   if (!isPlainObject(payload)) {
     return undefined;
   }
-  const direct = normalizeUsagePayload(payload.usage);
+  const direct = normalizeUsagePayload(payload.usage ?? payload.response?.usage);
   if (direct) {
     return direct;
   }
@@ -2322,18 +2578,6 @@ function sanitizeProxyPayload(value, alias) {
     sanitizeProxyPayload(value[key], alias);
   }
   return value;
-}
-
-function sanitizeProxyJsonBuffer(buffer, contentType, alias) {
-  const payload = parseJsonPayload(buffer, contentType);
-  if (!payload) {
-    return buffer;
-  }
-  return Buffer.from(JSON.stringify(sanitizeProxyPayload(payload, alias)), 'utf8');
-}
-
-function parseJsonUsage(buffer, contentType = '') {
-  return extractUsageFromPayload(parseJsonPayload(buffer, contentType));
 }
 
 function isBillableStatus(status) {
@@ -2494,15 +2738,14 @@ function applyUsageAccounting(logEntry, modelAlias, usage, billableUsage) {
   if (billableUsage) {
     logEntry.billableUsage = billableUsage;
   }
-  const cost = estimateCost(modelAlias, usage, billableUsage, logEntry.status);
-  if (cost) {
-    logEntry.estimatedCost = cost;
-  }
+  logEntry.estimatedCost = estimateCost(modelAlias, usage, billableUsage, logEntry.status) ?? null;
 }
 
 function estimatedCostFromLog(log) {
-  const calculated = estimateCost(log.modelAlias, log.usage, billableUsageFromLog(log), log.status);
-  return calculated || log.estimatedCost;
+  if (log.estimatedCost !== undefined) {
+    return log.estimatedCost ?? undefined;
+  }
+  return estimateCost(log.modelAlias, log.usage, billableUsageFromLog(log), log.status);
 }
 
 function enrichLogWithBilling(log) {
@@ -2513,66 +2756,73 @@ function enrichLogWithBilling(log) {
   };
 }
 
-function sanitizeSseDataLine(line, alias) {
-  if (!line.startsWith('data:')) {
-    return line;
-  }
-  const data = line.slice(5).trimStart();
-  if (!data || data === '[DONE]') {
-    return line;
-  }
+function sanitizeSseEvent(lines, alias, onPayload) {
+  const data = lines.filter((line) => line === 'data' || line.startsWith('data:'));
+  if (!data.length) return lines.join('\n');
+  let payload;
   try {
-    const payload = JSON.parse(data);
-    return `data: ${JSON.stringify(sanitizeProxyPayload(payload, alias))}`;
+    payload = JSON.parse(data.map((line) => line.slice(5).replace(/^ /, '')).join('\n'));
   } catch {
-    return line;
+    return lines.join('\n');
   }
+  onPayload(payload);
+  const fields = lines.filter((line) => line !== 'data' && !line.startsWith('data:'));
+  fields.push(`data: ${JSON.stringify(sanitizeProxyPayload(payload, alias))}`);
+  return fields.join('\n');
 }
 
-function createProxyStreamSanitizer(contentType, alias) {
-  if (!contentType.toLowerCase().includes('text/event-stream')) {
-    return undefined;
-  }
+function createProxyStreamSanitizer(alias, onPayload) {
+  const decoder = new StringDecoder('utf8');
   let pending = '';
+  let eventLines = [];
+  let eventLength = 0;
+  const maxEventLength = 26_214_400;
+
+  const processText = (text, flush = false) => {
+    pending += text;
+    if (flush && pending.endsWith('\r')) pending += '\n';
+    // Retain a trailing CR until the next chunk can complete a CRLF.
+    const lines = pending.split(/\r\n|\n|\r(?=[\s\S])/);
+    pending = lines.pop() || '';
+    let output = '';
+    for (const line of lines) {
+      if (line === '') {
+        output += eventLines.length ? `${sanitizeSseEvent(eventLines, alias, onPayload)}\n\n` : '\n';
+        eventLines = [];
+        eventLength = 0;
+      } else {
+        eventLines.push(line);
+        eventLength += line.length + 1;
+        if (eventLength > maxEventLength) {
+          throw new Error('Upstream SSE event exceeded the size limit.');
+        }
+      }
+    }
+    if (eventLength + pending.length > maxEventLength) {
+      throw new Error('Upstream SSE event exceeded the size limit.');
+    }
+    if (flush) {
+      if (pending) eventLines.push(pending);
+      if (eventLines.length) output += sanitizeSseEvent(eventLines, alias, onPayload);
+    }
+    return output;
+  };
+
   return new Transform({
     transform(chunk, encoding, callback) {
-      pending += chunk.toString('utf8');
-      const lines = pending.split(/\r?\n/);
-      pending = lines.pop() || '';
-      const sanitized = lines.map((line) => sanitizeSseDataLine(line, alias)).join('\n');
-      callback(null, sanitized ? `${sanitized}\n` : '');
+      try {
+        callback(null, processText(decoder.write(chunk)));
+      } catch (error) {
+        callback(error);
+      }
     },
     flush(callback) {
-      callback(null, pending ? sanitizeSseDataLine(pending, alias) : '');
-    }
-  });
-}
-
-function pipeUpstreamBody(body, res, contentType = '', alias = '') {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const stream = Readable.fromWeb(body);
-    const sanitizer = alias ? createProxyStreamSanitizer(contentType, alias) : undefined;
-    const output = sanitizer ? stream.pipe(sanitizer) : stream;
-    let settled = false;
-    const settle = (callback, value) => {
-      if (settled) {
-        return;
+      try {
+        callback(null, processText(decoder.end(), true));
+      } catch (error) {
+        callback(error);
       }
-      settled = true;
-      stream.removeListener('error', onError);
-      sanitizer?.removeListener('error', onError);
-      res.removeListener('finish', onFinish);
-      res.removeListener('close', onClose);
-      callback(value);
-    };
-    const onError = (error) => settle(rejectPromise, error);
-    const onFinish = () => settle(resolvePromise);
-    const onClose = () => settle(resolvePromise);
-    stream.on('error', onError);
-    sanitizer?.on('error', onError);
-    res.on('finish', onFinish);
-    res.on('close', onClose);
-    output.pipe(res);
+    }
   });
 }
 
@@ -2580,14 +2830,28 @@ async function handleProxy(req, res, url, auth) {
   const started = Date.now();
   const requestId = req.headers['x-request-id'] || randomUUID();
   const endpointKind = classifyEndpoint(url.pathname);
+  const clientAbort = new AbortController();
+  const { signal } = clientAbort;
+  const onClose = () => {
+    if (!res.writableFinished) {
+      clientAbort.abort(httpError(499, 'Client disconnected.'));
+    }
+  };
+  res.once('close', onClose);
   let requestRelease = () => undefined;
+  let debitId;
+  let tariff;
+  let actualImages;
+  let startedResponse = false;
   let logEntry = {
     requestId,
     time: new Date().toISOString(),
     apiKeyId: auth.key.id,
+    ...(auth.key.accountId && { accountId: auth.key.accountId, username: auth.key.username, modelGroup: auth.key.modelGroup }),
     endpoint: url.pathname,
     status: 500,
-    durationMs: 0
+    durationMs: 0,
+    estimatedCost: null
   };
 
   try {
@@ -2598,7 +2862,15 @@ async function handleProxy(req, res, url, auth) {
     }
 
     const proxyBody = await readProxyBody(req);
-    const resolved = resolveModel(proxyBody.model, endpointKind);
+    logEntry.modelAlias = proxyBody.model || config.routing?.defaultModel;
+    if (auth.key.accountId) {
+      const alias = proxyBody.model || config.routing?.defaultModel;
+      if (!config.models?.[alias] || !modelVisibleToKey(auth.key, alias, config.models[alias])) throw httpError(403, '该 Key 的分组未开放此模型');
+      if (req.method !== 'POST' || !PREPAID_PROXY_PATHS.has(url.pathname)) throw httpError(403, '此接口未向注册用户开放');
+      if (accountRequestReferencesSharedResource(proxyBody.requestBody)) throw httpError(400, '公共渠道仅支持在请求内提交上下文和文件');
+      if (endpointKind === 'responses' || endpointKind === 'chat') proxyBody.requestBody.store = false;
+    }
+    const resolved = resolveModel(proxyBody.model, endpointKind, auth.key.accountId ? auth.key : undefined);
     if (!resolved.ok) {
       logEntry.status = resolved.status;
       logEntry.modelAlias = proxyBody.model;
@@ -2623,16 +2895,34 @@ async function handleProxy(req, res, url, auth) {
       provider: candidates[0].provider,
       attempts
     };
-    requestRelease = await acquireConcurrency(requestConcurrencyScopes(auth, alias, mapping), {
-      requestId,
-      apiKeyId: auth.key.id,
-      modelAlias: alias
-    });
+    requestRelease = await acquireConcurrency(requestConcurrencyScopes(auth, alias, mapping), { signal });
+
+    if (auth.key.prepaid) {
+      if (req.method !== 'POST' || !PREPAID_PROXY_PATHS.has(url.pathname)) throw httpError(403, '此接口未开放预付费调用');
+      const priceModel = cnyPriceId(alias, mapping.upstreamModel);
+      tariff = cnyPrice(priceModel);
+      const version = config.cnyPricing?.version || PRICE_DATE;
+      if (!tariff || Boolean(tariff.image) !== (endpointKind === 'images')) {
+        throw httpError(422, '该模型或接口尚未配置售价');
+      }
+      if (tariff.image && proxyBody.stream) throw httpError(422, '按次计费的图像模型目前仅支持非流式返回');
+      if (endpointKind === 'chat' && proxyBody.kind === 'json' && proxyBody.stream) {
+        proxyBody.requestBody.stream_options = { ...proxyBody.requestBody.stream_options, include_usage: true };
+      }
+      const maxDuration = candidates.reduce((ms, c) => ms + normalizeTimeout(c.providerConfig.timeoutMs,120000)
+        + Number(config.limits?.queueTimeoutMs || 0), 60000);
+      const required = prepaidAdmission(tariff, endpointKind, proxyBody);
+      debitId = await (await walletStore()).begin(auth.key.walletId, priceModel, maxDuration, version, required);
+      logEntry.billingId = debitId;
+      logEntry.priceVersion = version;
+    }
 
     let lastFailure = null;
     for (const [index, candidate] of candidates.entries()) {
       const provider = candidate.providerConfig;
       let providerRelease = () => undefined;
+      let upstreamTimeout;
+      let streamedUsage;
       const attempt = {
         provider: candidate.provider,
         upstreamModel: candidate.upstreamModel,
@@ -2647,13 +2937,13 @@ async function handleProxy(req, res, url, auth) {
         logEntry.provider = candidate.provider;
         logEntry.upstreamModel = candidate.upstreamModel;
         providerRelease = await acquireConcurrency(providerConcurrencyScopes(candidate), {
-          requestId,
-          provider: candidate.provider,
-          modelAlias: alias,
+          signal,
           retryable: true
         });
+        signal.throwIfAborted();
 
         if (provider.type === 'mock') {
+          startedResponse = true;
           await handleMockProvider(req, res, {
             requestId,
             endpointKind,
@@ -2682,11 +2972,13 @@ async function handleProxy(req, res, url, auth) {
           throw httpError(502, `Provider API key missing. Set ${provider.apiKeyEnv || 'provider.apiKey'} for ${candidate.provider}.`);
         }
 
+        upstreamTimeout = AbortSignal.timeout(normalizeTimeout(provider.timeoutMs, 120_000));
         const upstream = await fetch(buildUpstreamUrl(provider, url.pathname, url.search), {
           method: req.method,
           headers: buildUpstreamHeaders(req, provider, requestId, { bodyKind: proxyBody.kind }),
           body: proxyBody.buildUpstreamBody(candidate.upstreamModel),
-          signal: AbortSignal.timeout(normalizeTimeout(provider.timeoutMs, 120_000))
+          redirect: 'error',
+          signal: AbortSignal.any([signal, upstreamTimeout])
         });
 
         attempt.status = upstream.status;
@@ -2699,7 +2991,7 @@ async function handleProxy(req, res, url, auth) {
             upstreamModel: candidate.upstreamModel,
             error: `Upstream ${candidate.provider} returned HTTP ${upstream.status}`
           };
-          await upstream.arrayBuffer().catch(() => undefined);
+          await upstream.body?.cancel().catch(() => undefined);
           continue;
         }
 
@@ -2720,19 +3012,41 @@ async function handleProxy(req, res, url, auth) {
           return;
         }
 
+        startedResponse = true;
         setProxyResponseHeaders(res, upstream, requestId, alias);
         if (upstream.body) {
-          if (proxyBody.stream) {
-            await pipeUpstreamBody(upstream.body, res, upstream.headers.get('content-type') || '', alias);
-            applyUsageAccounting(logEntry, alias, undefined, buildBillableUsage({
+          const contentType = upstream.headers.get('content-type') || '';
+          const isSse = contentType.toLowerCase().includes('text/event-stream');
+          if (isSse || (proxyBody.stream && !contentType.toLowerCase().includes('json'))) {
+            const stream = Readable.fromWeb(upstream.body);
+            if (isSse) {
+              const sanitizer = createProxyStreamSanitizer(alias, (payload) => {
+                if (payload?.type === 'message_start') {
+                  streamedUsage = normalizeUsagePayload(payload.message?.usage);
+                } else if (payload?.type === 'message_delta' && streamedUsage && payload.usage?.output_tokens !== undefined) {
+                  streamedUsage.outputTokens = Number(payload.usage.output_tokens);
+                  streamedUsage.totalTokens = streamedUsage.inputTokens + streamedUsage.outputTokens;
+                } else {
+                  const reportedUsage = extractUsageFromPayload(payload);
+                  if (reportedUsage) streamedUsage = reportedUsage;
+                }
+              });
+              res.setHeader('x-accel-buffering', 'no');
+              res.flushHeaders();
+              await pipeline(stream, sanitizer, res);
+            } else {
+              await pipeline(stream, res);
+            }
+            applyUsageAccounting(logEntry, alias, streamedUsage, buildBillableUsage({
               endpointKind,
               requestBody: proxyBody.requestBody,
-              status: logEntry.status
+              status: logEntry.status,
+              usage: streamedUsage
             }));
           } else {
             const payload = Buffer.from(await upstream.arrayBuffer());
-            const contentType = upstream.headers.get('content-type') || '';
             const responsePayload = parseJsonPayload(payload, contentType);
+            if (tariff?.image) actualImages = countGeneratedImages(responsePayload);
             const usage = extractUsageFromPayload(responsePayload);
             applyUsageAccounting(logEntry, alias, usage, buildBillableUsage({
               endpointKind,
@@ -2741,7 +3055,7 @@ async function handleProxy(req, res, url, auth) {
               status: logEntry.status,
               usage
             }));
-            res.end(sanitizeProxyJsonBuffer(payload, contentType, alias));
+            res.end(responsePayload === undefined ? payload : JSON.stringify(sanitizeProxyPayload(responsePayload, alias)));
           }
         } else {
           applyUsageAccounting(logEntry, alias, undefined, buildBillableUsage({
@@ -2753,9 +3067,12 @@ async function handleProxy(req, res, url, auth) {
         }
         return;
       } catch (error) {
-        attempt.status = statusFromProxyError(error);
+        const clientDisconnected = signal.aborted
+          && (!res.headersSent || error.code === 'ERR_STREAM_PREMATURE_CLOSE' || error === signal.reason || error.name === 'AbortError');
+        attempt.status = upstreamTimeout?.aborted ? 504 : clientDisconnected ? 499 : statusFromProxyError(error);
         attempt.error = error.message;
-        const canFailover = hasNextCandidate && (error.retryable || shouldFailoverError(error));
+        const canFailover = !signal.aborted && !res.headersSent && !res.destroyed
+          && hasNextCandidate && (error.retryable || shouldFailoverError(error));
         attempt.retryable = canFailover;
         lastFailure = {
           status: attempt.status,
@@ -2764,9 +3081,22 @@ async function handleProxy(req, res, url, auth) {
           error: error.message
         };
         if (!canFailover) {
-          attempt.durationMs = Date.now() - attemptStarted;
           logEntry.status = attempt.status;
           logEntry.error = error.message;
+          if (streamedUsage) {
+            applyUsageAccounting(logEntry, alias, streamedUsage, buildBillableUsage({
+              endpointKind,
+              requestBody: proxyBody.requestBody,
+              status: logEntry.status,
+              usage: streamedUsage
+            }));
+          }
+          if (res.destroyed || signal.aborted) return;
+          if (res.headersSent) {
+            res.destroy();
+            return;
+          }
+          res.removeHeader('content-disposition');
           sendJson(res, attempt.status, {
             error: 'Upstream request failed.',
             request_id: requestId,
@@ -2790,19 +3120,31 @@ async function handleProxy(req, res, url, auth) {
     }, { 'x-request-id': requestId, 'x-jetlink-model-alias': logEntry.modelAlias || '' });
   } catch (error) {
     logEntry.error = error.message;
-    const status = error.status || 500;
+    const status = signal.aborted ? 499 : error.status || 500;
     logEntry.status = status;
+    if (res.destroyed || signal.aborted) return;
     if (!res.headersSent) {
       sendJson(res, status, {
         error: status >= 500 ? 'Internal gateway error.' : error.message,
         request_id: requestId
       });
     } else {
-      res.end();
+      res.destroy();
     }
   } finally {
+    res.removeListener('close', onClose);
     logEntry.durationMs = Date.now() - started;
     requestRelease();
+    if (debitId) {
+      try {
+        const charge = startedResponse ? usageCharge(tariff, logEntry.usage, actualImages) : 0n;
+        logEntry.chargedCny = await (await walletStore()).settle(debitId, charge, {
+          requestId, status: logEntry.status, usage: logEntry.usage, images: actualImages
+        });
+      } catch (error) {
+        console.error('Wallet settlement pending', debitId, error.message);
+      }
+    }
     pushRequestLog(logEntry);
   }
 }
@@ -2817,11 +3159,11 @@ async function handleMockProvider(req, res, context) {
   if (body.stream) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache',
+      'x-accel-buffering': 'no',
       connection: 'keep-alive',
       ...headers
     });
-    const chunks = ['JetLinksAPI ', 'stream ', `response for ${alias}.`];
+    const chunks = ['Wormhole AI ', 'stream ', `response for ${alias}.`];
     for (const chunk of chunks) {
       res.write(
         `data: ${JSON.stringify({
@@ -2867,12 +3209,12 @@ async function handleMockProvider(req, res, context) {
       id: `resp-${requestId}`,
       object: 'response',
       model: alias,
-      output_text: `JetLinksAPI response for ${alias}.`,
+      output_text: `Wormhole AI response for ${alias}.`,
       output: [
         {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: `JetLinksAPI response for ${alias}.` }]
+          content: [{ type: 'output_text', text: `Wormhole AI response for ${alias}.` }]
         }
       ],
       usage: { input_tokens: 12, output_tokens: 12, total_tokens: 24 }
@@ -2886,7 +3228,7 @@ async function handleMockProvider(req, res, context) {
       type: 'message',
       role: 'assistant',
       model: alias,
-      content: [{ type: 'text', text: `JetLinksAPI message for ${alias}.` }],
+      content: [{ type: 'text', text: `Wormhole AI message for ${alias}.` }],
       stop_reason: 'end_turn',
       usage: { input_tokens: 12, output_tokens: 12 }
     }, headers);
@@ -2903,7 +3245,7 @@ async function handleMockProvider(req, res, context) {
         index: 0,
         message: {
           role: 'assistant',
-          content: `JetLinksAPI response for ${alias}.`
+          content: `Wormhole AI response for ${alias}.`
         },
         finish_reason: 'stop'
       }
@@ -2922,19 +3264,73 @@ function pushRequestLog(entry) {
   });
 }
 
+async function requestLogPage(params, keyFilter, customer = false) {
+  const search = (params.get('q') || '').trim().toLowerCase().slice(0, 128);
+  const userFilter = (params.get('user') || params.get('username') || '').trim().toLowerCase().slice(0, 128);
+  const status = params.get('status');
+  const limit = Math.max(1, Math.min(500, Number.parseInt(params.get('limit'), 10) || 100));
+
+  const missingAccountIds = !customer ? [...new Set(requestLogs.filter(e => e.accountId && !e.username).map(e => e.accountId))] : [];
+  let userMap = new Map();
+  if (missingAccountIds.length) {
+    try {
+      userMap = await (await walletStore()).accounts.userMap(missingAccountIds);
+      for (const entry of requestLogs) {
+        if (entry.accountId && !entry.username && userMap.has(entry.accountId)) {
+          entry.username = userMap.get(entry.accountId);
+        }
+      }
+    } catch (e) {
+      console.warn('Unable to populate usernames for logs:', e.message);
+    }
+  }
+
+  const filtered = requestLogs.filter((entry) => {
+    if (keyFilter && !keyFilter(entry)) return false;
+    const success = entry.status >= 200 && entry.status < 300;
+    if ((status === 'success' && !success) || (status === 'failed' && success)) return false;
+    if (userFilter && !customer) {
+      const match = [entry.username, entry.accountId].some(v => typeof v === 'string' && v.toLowerCase().includes(userFilter));
+      if (!match) return false;
+    }
+    return !search || [entry.requestId, entry.modelAlias, entry.apiKeyId, entry.endpoint,
+      ...(customer ? [] : [entry.provider, entry.accountId, entry.username, entry.modelGroup])].some((value) =>
+      typeof value === 'string' && value.toLowerCase().includes(search));
+  });
+  const page = Math.max(1, Math.min(Math.ceil(filtered.length / limit), Number.parseInt(params.get('page'), 10) || 1));
+  const entries = filtered.slice((page - 1) * limit, page * limit);
+  const pending = entries.filter(log => log.billingId && log.chargedCny == null).map(log => log.billingId);
+  const states = new Map((pending.length ? await (await walletStore()).chargeStates(pending) : []).map(row => [row.id, row]));
+  const data = entries.map((entry) => {
+    const state = states.get(entry.billingId);
+    const log = {
+      ...entry,
+      username: entry.username || (entry.accountId ? userMap.get(entry.accountId) : undefined),
+      chargedCny: state?.chargedCny ?? entry.chargedCny,
+      billingState: state?.state ?? (entry.billingId ? (entry.chargedCny == null ? 'active' : 'settled') : undefined),
+      priceVersion: entry.priceVersion || state?.version
+    };
+    if (!customer) return enrichLogWithBilling(log);
+    const { requestId, time, apiKeyId, endpoint, status, durationMs, modelAlias, usage, chargedCny, billingState, priceVersion } = log;
+    return { requestId, time, apiKeyId, endpoint, status, durationMs, modelAlias, usage, chargedCny, billingState, priceVersion };
+  });
+  return { data, total: filtered.length, page, limit };
+}
+
 function publicModelList(key) {
   return Object.entries(config.models || {})
     .filter(([, model]) => model.enabled !== false)
     .filter(([alias, model]) => !key || modelVisibleToKey(key, alias, model))
-    .map(([alias, model]) => publicModelDescriptor(alias, model));
+    .map(([alias, model]) => publicModelDescriptor(alias, model, key));
 }
 
-function publicModelDescriptor(alias, model) {
+function publicModelDescriptor(alias, model, key) {
   return {
     id: alias,
     object: 'model',
     created: 0,
-    owned_by: 'jetlinksapi',
+    owned_by: 'wormhole-ai',
+    ...(key?.accountId ? {groups:key.modelGroup ? [key.modelGroup] : modelGroups(model)} : {}),
     endpoints: model.endpoints || ['*'],
     description: model.description || ''
   };
@@ -3171,7 +3567,7 @@ async function buildDiagnostics() {
   }
   return {
     time: new Date().toISOString(),
-    name: 'JetLinksAPI Gateway',
+    name: 'Wormhole AI Gateway',
     publicBaseUrl: config.publicBaseUrl,
     configFile: configState.path,
     persistent: configState.persistent,
@@ -3219,6 +3615,122 @@ function prometheusMetrics() {
   return `${lines.join('\n')}\n`;
 }
 
+async function discoverProviderModels(provider) {
+  if (provider.type !== 'openai-compatible' || !provider.baseUrl || !providerConfigured(provider)) {
+    throw httpError(400, '此通道需配置兼容接口地址和上游凭据才能获取模型');
+  }
+  const signal = AbortSignal.timeout(Math.min(normalizeTimeout(provider.timeoutMs, 30_000), 30_000));
+  try {
+    const response = await fetch(buildUpstreamUrl(provider, '/v1/models', ''), {
+      headers: buildUpstreamHeaders({ headers: {} }, provider, randomUUID()),
+      redirect: 'error',
+      signal
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw httpError(502, '上游模型列表请求失败，HTTP ' + response.status);
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body || []) {
+      size += chunk.length;
+      if (size > 2 * 1024 * 1024) throw httpError(502, '上游模型列表超过 2 MB');
+      chunks.push(chunk);
+    }
+    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const rows = Array.isArray(payload?.data) ? payload.data : payload?.models;
+    if (!Array.isArray(rows)) throw httpError(502, '上游响应没有有效的模型列表');
+    const ids = rows.map(row => row?.id ?? row?.slug).filter(id =>
+      typeof id === 'string' && id.trim() === id && id.length > 0 && id.length <= 256 && !/[\x00-\x1f\x7f]/.test(id));
+    return [...new Set(ids)];
+  } catch (error) {
+    if (error.status) throw error;
+    if (signal.aborted) throw httpError(504, '获取上游模型列表超时');
+    throw httpError(502, '无法读取上游模型列表，请检查通道地址及上游响应');
+  }
+}
+
+function planProviderMappings(providerId, ids, models) {
+  const mapped = new Map();
+  for (const [alias, model] of Object.entries(models)) {
+    for (const route of configuredRouteCandidates(model)) {
+      if (route.provider === providerId) mapped.set(route.upstreamModel, alias);
+    }
+  }
+  const usedAliases = new Set([...Object.keys(models), ...Object.getOwnPropertyNames(Object.prototype)]);
+  // Reserve upstream IDs first, so a normalized alias never takes a literal ID's place.
+  const literal = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
+  const reserved = new Set(ids.filter(id => literal.test(id) && !mapped.has(id) && !usedAliases.has(id)));
+  return ids.map(id => {
+    const existing = mapped.get(id);
+    let alias = existing || id;
+    if (!existing && !reserved.has(id)) {
+      const safeId = (providerId + '.' + id).replace(/[^a-zA-Z0-9._:-]/g, '-');
+      const hash = createHash('sha256').update(id).digest('hex').slice(0, 10);
+      alias = safeId.slice(0, 116) + '-' + hash;
+      for (let index = 2; usedAliases.has(alias) || reserved.has(alias); index++) {
+        alias = safeId.slice(0, 105) + '-' + hash + '-' + index;
+      }
+    }
+    usedAliases.add(alias);
+    const price = cnyPrice(cnyPriceId(alias, id));
+    const billing = price?.image ? 'image' : price?.standard ? 'token' : null;
+    return { id, alias, existing: Boolean(existing), billing };
+  });
+}
+
+async function handleProviderModelImport(req, res, auth, providerId) {
+  const provider = Object.hasOwn(config.providers || {}, providerId) ? config.providers[providerId] : undefined;
+  if (!provider) throw httpError(404, '通道不存在');
+  if (req.method === 'GET') {
+    const ids = await discoverProviderModels(provider);
+    sendJson(res, 200, { data: planProviderMappings(providerId, ids, config.models || {}) });
+    return;
+  }
+  if (req.headers.origin && !accountOrigin(req)) throw httpError(403, '请求来源不受信任');
+  if (req.headers['content-type']?.split(';')[0] !== 'application/json') throw httpError(415, '请提交 JSON');
+  const body = await readJsonBody(req);
+  if (!Array.isArray(body?.ids) || body.ids.length < 1 || body.ids.length > 1000
+    || body.ids.some(id => typeof id !== 'string' || id.length > 256)
+    || !Array.isArray(body.endpoints) || !body.endpoints.length) {
+    throw httpError(400, '请选择 1–1000 个模型及其支持的接口');
+  }
+  const endpoints = normalizeEndpoints(body.endpoints);
+  const upstreamModels = await discoverProviderModels(provider);
+  const upstreamIds = new Set(upstreamModels);
+  if (config.providers?.[providerId] !== provider) throw httpError(409, '通道已修改，请重新获取模型列表');
+  const ids = new Set(body.ids);
+  if ([...ids].some(id => !upstreamIds.has(id))) throw httpError(409, '有模型已从上游下架，请重新获取列表');
+  const original = config.models;
+  const next = { ...original };
+  const result = [];
+  for (const item of planProviderMappings(providerId, upstreamModels, original || {})) {
+    const { id, alias, existing, billing } = item;
+    if (!ids.has(id)) continue;
+    if (existing) {
+      result.push({ id, alias, status: 'existing' });
+      continue;
+    }
+    const pricedEndpoints = billing === 'image' ? ['images'] : ['chat', 'responses', 'messages', 'embeddings'];
+    const published = body.publish === true && billing !== null && endpoints.every(endpoint => pricedEndpoints.includes(endpoint));
+    next[alias] = normalizeModelInput(alias, { provider: providerId, upstreamModel: id, endpoints, saasEnabled: published });
+    result.push({ id, alias, status: published ? 'published' : 'internal' });
+  }
+  if (result.some(item => item.status !== 'existing')) {
+    config.models = next;
+    try {
+      await saveConfig();
+    } catch (error) {
+      if (config.models === next) config.models = original;
+      throw error;
+    }
+    auditAdminAction(auth, 'import', 'provider-models', providerId, {
+      imported: result.filter(item => item.status !== 'existing').length
+    });
+  }
+  sendJson(res, 200, { data: result });
+}
+
 async function checkProviderHealth(id, provider, live = false) {
   const configured = providerConfigured(provider);
   const base = {
@@ -3251,6 +3763,7 @@ async function checkProviderHealth(id, provider, live = false) {
     const upstream = await fetch(buildUpstreamUrl(provider, '/v1/models', ''), {
       method: 'GET',
       headers: buildUpstreamHeaders({ headers: {} }, provider, randomUUID()),
+      redirect: 'error',
       signal: AbortSignal.timeout(normalizeTimeout(provider.timeoutMs, 30_000))
     });
     const detail = upstream.ok ? '' : await upstreamErrorDetail(upstream);
@@ -3271,10 +3784,38 @@ async function checkProviderHealth(id, provider, live = false) {
   }
 }
 
+// Codex model picker expects the native catalog shape rather than the OpenAI SDK list.
+function codexModelCatalog(key) {
+  return publicModelList(key).filter(model =>
+    model.endpoints.some(endpoint => endpoint === 'responses' || endpoint === '*') &&
+    (!key.allowedEndpoints || key.allowedEndpoints.some(endpoint => endpoint === '*' || endpoint === 'responses'))
+  ).map((model, priority) => ({
+    slug: model.id,
+    display_name: model.id,
+    description: model.description || null,
+    priority,
+    visibility: 'list',
+    supported_in_api: true,
+    shell_type: 'shell_command',
+    supported_reasoning_levels: [],
+    support_verbosity: false,
+    supports_parallel_tool_calls: false,
+    truncation_policy: { mode: 'tokens', limit: 10_000 },
+    experimental_supported_tools: [],
+    base_instructions: 'You are a coding assistant. Help the user with their software development tasks.',
+    input_modalities: ['text']
+  }));
+}
+
 async function handleModels(req, res, url) {
-  const auth = authenticate(req);
+  const auth = await authenticateProxy(req);
   if (!auth.ok) {
     sendJson(res, auth.status, { error: auth.error });
+    return;
+  }
+  if (url.pathname === '/v1/codex/models') {
+    if (req.method !== 'GET') throw httpError(405, '只允许读取 Codex 模型目录');
+    sendJson(res, 200, { models: codexModelCatalog(auth.key) });
     return;
   }
   const parts = url.pathname.split('/').filter(Boolean);
@@ -3293,8 +3834,56 @@ async function handleModels(req, res, url) {
     return;
   }
   sendJson(res, 200, {
-    ...publicModelDescriptor(alias, model)
+    ...publicModelDescriptor(alias, model, auth.key)
   });
+}
+
+function verifyAdminLogin(req, username, password) {
+  const rate = checkAdminLoginRateLimit(req);
+  if (!rate.ok) throw httpError(429, `Too many sign-in attempts. Retry after ${rate.retryAfterSeconds}s.`);
+  if (
+    safeTextEqual(username.toLowerCase(), superAdminUsername().toLowerCase()) &&
+    typeof password === 'string' &&
+    password.length <= 256 &&
+    verifySuperAdminPassword(password)
+  )
+    return true;
+  pushAuditLog({
+    id: randomUUID(),
+    time: new Date().toISOString(),
+    actorKeyId: 'anonymous',
+    action: 'login_failed',
+    resource: 'admin-session',
+    target: username || 'unknown',
+    details: { remoteAddress: clientAddress(req) }
+  });
+  return false;
+}
+
+function revokeAdminSession(req) {
+  const token = parseCookies(req)[ADMIN_SESSION_COOKIE];
+  if (token) adminSessions.delete(hashSessionToken(token));
+}
+
+function sendAdminLogin(req, res, extraCookies = []) {
+  revokeAdminSession(req);
+  const ttl = Math.floor(ADMIN_SESSION_TTL_MS / 1000);
+  const cookie = adminSessionCookie(req, createAdminSession(), ttl);
+  pushAuditLog({
+    id: randomUUID(),
+    time: new Date().toISOString(),
+    actorKeyId: 'console-session',
+    action: 'login',
+    resource: 'admin-session',
+    target: superAdminUsername(),
+    details: { remoteAddress: clientAddress(req) }
+  });
+  sendJson(
+    res,
+    200,
+    { role: 'admin', user: superAdminUserPayload(), expiresInSeconds: ttl },
+    { 'set-cookie': [cookie, ...extraCookies] }
+  );
 }
 
 async function handleAdminSession(req, res, url) {
@@ -3370,53 +3959,14 @@ async function handleAdminSession(req, res, url) {
   }
 
   if (req.method === 'POST') {
-    const loginRate = checkAdminLoginRateLimit(req);
-    if (!loginRate.ok) {
-      sendJson(res, 429, { error: `Too many sign-in attempts. Retry after ${loginRate.retryAfterSeconds}s.` });
-      return;
-    }
     const body = await readJsonBody(req);
-    const username = cleanString(body.username);
-    const password = String(body.password || '');
-    const valid = safeTextEqual(username.toLowerCase(), superAdminUsername().toLowerCase())
-      && verifySuperAdminPassword(password);
-    if (!valid) {
-      pushAuditLog({
-        id: randomUUID(),
-        time: new Date().toISOString(),
-        actorKeyId: 'anonymous',
-        action: 'login_failed',
-        resource: 'admin-session',
-        target: username || 'unknown',
-        details: { remoteAddress: clientAddress(req) }
-      });
-      sendJson(res, 401, { error: 'Invalid super admin credentials.' });
-      return;
-    }
-    const token = createAdminSession();
-    pushAuditLog({
-      id: randomUUID(),
-      time: new Date().toISOString(),
-      actorKeyId: 'console-session',
-      action: 'login',
-      resource: 'admin-session',
-      target: superAdminUsername(),
-      details: { remoteAddress: clientAddress(req) }
-    });
-    sendJson(res, 200, {
-      user: superAdminUserPayload(),
-      expiresInSeconds: Math.floor(ADMIN_SESSION_TTL_MS / 1000)
-    }, {
-      'set-cookie': adminSessionCookie(req, token, Math.floor(ADMIN_SESSION_TTL_MS / 1000))
-    });
+    if (!verifyAdminLogin(req, cleanString(body?.username), body?.password)) throw httpError(401, 'Invalid super admin credentials.');
+    sendAdminLogin(req, res);
     return;
   }
 
   if (req.method === 'DELETE') {
-    const token = parseCookies(req)[ADMIN_SESSION_COOKIE];
-    if (token) {
-      adminSessions.delete(hashSessionToken(token));
-    }
+    revokeAdminSession(req);
     sendJson(res, 200, { deleted: true }, {
       'set-cookie': clearAdminSessionCookie(req)
     });
@@ -3433,6 +3983,112 @@ async function handleAdmin(req, res, url) {
     return;
   }
 
+  const paymentRoute = /^\/admin\/payments\/(wechat|alipay)\/(.+)$/.exec(url.pathname);
+  if (paymentRoute) {
+    const store = await walletStore();
+    const [, channel, path] = paymentRoute;
+    const qrImage = paymentImages[channel];
+    const token = channel === 'wechat' ? wechatReceiptToken : receiptToken;
+    if (req.method !== 'GET' && req.headers.origin && !accountOrigin(req)) throw httpError(403, '请求来源不受信任');
+    if (req.method === 'GET' && path === 'settings') {
+      sendJson(res,200,{...await store.checkout(Boolean(qrImage),channel),shortcutConfigured:token.length >= 32});
+    } else if (req.method === 'GET' && path === 'qr') {
+      const image = await store.qr(qrImage,true,channel);
+      if (!image) throw httpError(404,'尚未配置收款码');
+      res.writeHead(200,{'content-type':image.type}); res.end(image.bytes);
+    } else if (req.method === 'PUT' && path === 'qr') {
+      const image = paymentQr(await readRawBody(req,maxQrBytes));
+      await store.saveQr(image.type,image.bytes,channel);
+      auditAdminAction(auth,'configure',channel,'qr',{});
+      sendJson(res,200,{ok:true});
+    } else if (req.method === 'PUT' && path === 'settings') {
+      const body = await readJsonBody(req);
+      if (typeof body?.enabled !== 'boolean') throw httpError(400,'请指定收款状态');
+      await store.setCheckout(body.enabled,Boolean(qrImage),channel);
+      auditAdminAction(auth,body.enabled?'enable':'pause',channel,'checkout',{});
+      sendJson(res,200,{ok:true});
+    } else if (req.method === 'GET' && path === 'orders') {
+      const orderId = (url.searchParams.get('id') || '').trim().toUpperCase();
+      const filter = (url.searchParams.get('filter') || 'pending').trim().toLowerCase();
+      if (orderId && !/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400,'请输入完整的 12 位网站订单号');
+      sendJson(res,200,{orders:await store.receiptOrders(orderId,channel,filter)});
+    } else if (req.method === 'DELETE' && path === 'orders') {
+      const orderId = (url.searchParams.get('id') || '').trim().toUpperCase();
+      if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400,'请输入完整的 12 位网站订单号');
+      if (await store.removeOrder(orderId,channel)) auditAdminAction(auth,'delete',channel,orderId,{});
+      sendJson(res,200,{ok:true});
+    } else if (req.method === 'POST' && path === 'confirm') {
+      if (req.headers['content-type']?.split(';')[0] !== 'application/json') throw httpError(415,'请提交 JSON');
+      const result = await store.confirm(channel,(await readJsonBody(req)) || {});
+      if (!result.repeated) auditAdminAction(auth,'confirm',channel,result.orderId,{amount:result.amount});
+      sendJson(res,200,result);
+    } else throw httpError(404,'没有找到该收款接口');
+    return;
+  }
+  const supportRoute = /^\/admin\/support\/([a-f0-9-]{36})(?:\/(reset|resolve))?$/.exec(url.pathname);
+  if (url.pathname === '/admin/support' && req.method === 'GET') {
+    sendJson(res, 200, { data: await (await walletStore()).accounts.support.list() });
+    return;
+  }
+  if (supportRoute) {
+    const [, id, operation] = supportRoute;
+    const support = (await walletStore()).accounts.support;
+    if (req.method === 'GET' && !operation) {
+      sendJson(res, 200, { data: await support.detail(id) });
+      return;
+    }
+    if (req.method !== 'POST') throw httpError(405, '不支持的请求方法');
+    if (req.headers.origin && !accountOrigin(req)) throw httpError(403, '请求来源不受信任');
+    if (req.headers['content-type']?.split(';')[0].trim() !== 'application/json') throw httpError(415, '需要 JSON 请求');
+    const body = await readJsonBody(req);
+    if (operation === 'resolve') {
+      const data = await support.resolve(id);
+      auditAdminAction(auth, 'resolve', 'support-thread', id);
+      sendJson(res, 200, { data });
+    } else if (operation === 'reset') {
+      const { owner, reset } = await support.authorizeReset(id, body?.username);
+      auditAdminAction(auth, 'authorize-password-reset', 'user', owner, { threadId: id });
+      sendJson(res, 200, { reset });
+    } else {
+      const data = await support.reply(id, body?.message);
+      auditAdminAction(auth, 'reply', 'support-thread', id);
+      sendJson(res, 200, { data });
+    }
+    return;
+  }
+
+  if (url.pathname === '/admin/users' && req.method === 'GET') {
+    const rows = await (await walletStore()).accounts.list(url.searchParams.get('after') || '');
+    sendJson(res,200,{data:rows.slice(0,50), next:rows.length > 50 ? rows[49].username : null});
+    return;
+  }
+  const userRoute = /^\/admin\/users\/([a-f0-9-]{36})$/.exec(url.pathname);
+  if (userRoute && req.method === 'PUT') {
+    const body = await readJsonBody(req);
+    if (typeof body?.enabled !== 'boolean') throw httpError(400,'请指定用户启用状态');
+    const data = await (await walletStore()).accounts.setEnabled(userRoute[1],body.enabled);
+    auditAdminAction(auth,body.enabled ? 'enable' : 'suspend','user',userRoute[1]);
+    sendJson(res,200,{data});
+    return;
+  }
+  if (url.pathname === '/admin/payments/reviews') {
+    const store = await walletStore();
+    if (req.method === 'GET') {
+      sendJson(res, 200, { data: await store.reviews() });
+      return;
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const units = parseYuan(body?.amount, 10);
+      if (units === null || typeof body.reason !== 'string' || !body.reason.trim() || body.reason.length > 500) {
+        throw httpError(400, '请提交人民币金额及核对依据（最多 500 字）');
+      }
+      const amount = await store.settle(body.id, units, { actor: auth.key.id, reason: body.reason.trim() }, true);
+      auditAdminAction(auth, 'settle', 'wallet-charge', body.id, { amount });
+      sendJson(res, 200, { amount });
+      return;
+    }
+  }
   if (req.method === 'GET' && url.pathname === '/admin/config') {
     sendJson(res, 200, safeConfig());
     return;
@@ -3512,6 +4168,11 @@ async function handleAdmin(req, res, url) {
 
   if (url.pathname.startsWith('/admin/providers/')) {
     const providerPath = decodeURIComponent(url.pathname.replace('/admin/providers/', ''));
+    if (providerPath.endsWith('/models') && ['GET', 'POST'].includes(req.method)) {
+      const providerId = assertConfigId(providerPath.slice(0, -'/models'.length), 'provider id');
+      await handleProviderModelImport(req, res, auth, providerId);
+      return;
+    }
     if (providerPath.endsWith('/health')) {
       const id = assertConfigId(providerPath.slice(0, -'/health'.length), 'provider id');
       const provider = config.providers?.[id];
@@ -3560,7 +4221,9 @@ async function handleAdmin(req, res, url) {
         return;
       }
       const referencedAliases = Object.entries(config.models || {})
-        .filter(([, model]) => model.provider === id)
+        .filter(([, model]) => model.provider === id
+          || (model.fallbacks || []).some((route) => route?.provider === id)
+          || (model.routes || []).some((route) => route?.provider === id))
         .map(([alias]) => alias);
       if (referencedAliases.length) {
         sendJson(res, 409, {
@@ -3668,6 +4331,7 @@ async function handleAdmin(req, res, url) {
       }
       const nextKeys = keys.filter((key) => key.id !== id);
       assertAdminKeyAvailable(nextKeys);
+      if (keys[index].walletManaged || keys[index].prepaid) await (await walletStore()).retire(keys[index].walletId);
       config.auth = { ...(config.auth || {}), internalApiKeys: nextKeys };
       const persisted = await saveConfig();
       auditAdminAction(auth, 'delete', 'api-key', id);
@@ -3677,8 +4341,111 @@ async function handleAdmin(req, res, url) {
   }
 
   if (req.method === 'GET' && url.pathname === '/admin/requests') {
-    const limit = Math.min(Number(url.searchParams.get('limit') || 100), 500);
-    sendJson(res, 200, { data: requestLogs.slice(0, limit).map(enrichLogWithBilling) });
+    sendJson(res, 200, await requestLogPage(url.searchParams));
+    return;
+  }
+
+  if (url.pathname === '/admin/model-groups' && req.method === 'GET') {
+    sendJson(res, 200, { data: managedGroups() });
+    return;
+  }
+  if (url.pathname === '/admin/model-groups' && ['POST', 'PUT'].includes(req.method)) {
+    const body = await readJsonBody(req);
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (!name || name.length > 48 || /[\u0000-\u001f\u007f]/.test(name)) throw httpError(400, '分组名称应为 1–48 个可见字符');
+    const editing = req.method === 'PUT';
+    const id = editing ? body?.id : 'grp-' + randomUUID();
+    await saveOperationsConfig('modelGroups', (groups) => {
+      const available = managedGroups();
+      if (editing && !available.some(group => group.id === id)) throw httpError(404, '分组不存在');
+      if (available.some(group => group.id !== id && (group.name || 'default').toLowerCase() === name.toLowerCase())) {
+        throw httpError(409, '已存在同名分组');
+      }
+      return { ...groups, [id]: { name } };
+    });
+    auditAdminAction(auth, editing ? 'update' : 'create', 'model-group', id, { name });
+    sendJson(res, editing ? 200 : 201, { data: managedGroups() });
+    return;
+  }
+
+  if (url.pathname === '/admin/model-groups' && req.method === 'DELETE') {
+    const id = url.searchParams.get('id');
+    if (id === 'default') throw httpError(409, '默认分组需要保留');
+    if (!id || deletingGroups.has(id)) throw httpError(409, '请选择可删除的分组，或稍后重试');
+    deletingGroups.add(id);
+    try {
+      await saveOperationsConfig('modelGroups', async (groups) => {
+        const group = managedGroups().find(item => item.id === id);
+        if (!group) throw httpError(404, '分组不存在');
+        if (group.channels.length) throw httpError(409, '请先将此分组的通道移到其他分组');
+        if (await (await walletStore()).accounts.hasGroupKeys(id)) {
+          throw httpError(409, '请先撤销此分组关联的用户 Key');
+        }
+        const remaining = { ...groups };
+        delete remaining[id];
+        return remaining;
+      });
+    } finally {
+      deletingGroups.delete(id);
+    }
+    auditAdminAction(auth, 'delete', 'model-group', id);
+    sendJson(res, 200, { data: managedGroups() });
+    return;
+  }
+
+  if (url.pathname === '/admin/cny-pricing' && req.method === 'GET') {
+    sendJson(res, 200, { prices: cnyPrices(), version: config.cnyPricing?.version || PRICE_DATE });
+    return;
+  }
+  if (url.pathname === '/admin/cny-pricing' && req.method === 'PUT') {
+    const body = await readJsonBody(req);
+    const id = body?.model;
+    if (typeof id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(id) || Object.hasOwn(Object.prototype, id)) {
+      throw httpError(400, '请输入有效的模型别名');
+    }
+    const price = normalizeCnyPrice(body?.price);
+    if (!price) throw httpError(400, '请填写有效的单价，最多支持四位小数');
+    const version = new Date().toISOString();
+    await saveOperationsConfig('cnyPricing', (current) => {
+      const previous = cnyPrice(id);
+      if (previous && Boolean(previous.image) !== Boolean(price.image)) throw httpError(409, '已有售价的模型不能切换计费单位');
+      const mapping = Object.hasOwn(config.models, id) ? config.models[id] : undefined;
+      const fallback = mapping && cnyPrice(mapping.upstreamModel);
+      if (mapping?.saasEnabled && fallback && Boolean(fallback.image) !== Boolean(price.image)) {
+        throw httpError(409, '已开放模型的计费单位必须与当前售价一致');
+      }
+      return { version, prices: { ...current?.prices, [id]: price } };
+    });
+    auditAdminAction(auth, 'update', 'cny-pricing', id, { version, price });
+    sendJson(res, 200, { prices: cnyPrices(), version });
+    return;
+  }
+
+  if (url.pathname === '/admin/cny-pricing' && req.method === 'DELETE') {
+    const id = assertConfigId(url.searchParams.get('model'), 'model alias');
+    if (deletingCnyPrices.has(id)) throw httpError(409, '此售价正在删除，请稍后重试');
+    const version = new Date().toISOString();
+    deletingCnyPrices.add(id);
+    try {
+      await saveOperationsConfig('cnyPricing', (current) => {
+        if (!cnyPrice(id)) throw httpError(404, '售价不存在');
+        const aliases = Object.entries(config.models || {}).filter(([alias, mapping]) =>
+          mapping.enabled !== false && cnyPriceId(alias, mapping.upstreamModel) === id &&
+          (mapping.saasEnabled || config.auth.internalApiKeys.some(key =>
+            key.enabled !== false && key.prepaid && keyAllows(alias, key.allowedModels)))
+        ).map(([alias]) => alias);
+        if (aliases.length) throw httpError(409, `售价仍在使用，请先下架关联模型：${aliases.join('、')}`);
+        const prices = { ...current?.prices };
+        // A null override keeps a bundled price deleted across restarts.
+        if (Object.hasOwn(CNY_PRICES, id)) prices[id] = null;
+        else delete prices[id];
+        return { version, prices };
+      });
+    } finally {
+      deletingCnyPrices.delete(id);
+    }
+    auditAdminAction(auth, 'delete', 'cny-pricing', id, { version });
+    sendJson(res, 200, { prices: cnyPrices(), version });
     return;
   }
 
@@ -3714,6 +4481,9 @@ async function handleAdmin(req, res, url) {
     if (req.method === 'PUT') {
       const body = await readJsonBody(req);
       const previousAlias = body.previousAlias ? assertConfigId(body.previousAlias, 'previous model alias') : '';
+      if (body.createOnly === true && Object.hasOwn(config.models, alias)) {
+        throw httpError(409, '模型别名已被使用，请选择其他别名');
+      }
       const renaming = Boolean(previousAlias && previousAlias !== alias);
       if (renaming && !config.models?.[previousAlias]) {
         sendJson(res, 404, { error: `Model alias not found: ${previousAlias}` });
@@ -3788,6 +4558,259 @@ async function handleAdmin(req, res, url) {
   sendJson(res, 404, { error: 'Admin endpoint not found.' });
 }
 
+const USER_COOKIE = 'jl_user_session';
+
+async function handleAccount(req, res, path, searchParams) {
+  if (!['GET', 'POST', 'PUT', 'DELETE'].includes(req.method)) throw httpError(405, '不支持的请求方法');
+  if (req.method !== 'GET') {
+    if (req.headers.origin && !accountOrigin(req)) throw httpError(403, '请求来源不受信任');
+    if (['POST', 'PUT'].includes(req.method) && req.headers['content-type']?.split(';')[0].trim() !== 'application/json')
+      throw httpError(415, '账户操作需要 JSON 请求');
+  }
+  const cookies = parseCookies(req);
+  const cookie = cookies[USER_COOKIE];
+  const supportPath = /^\/account-api\/support(?:\/(read|end|reset))?$/.exec(path);
+  if (supportPath) {
+    const operation = supportPath[1];
+    const token = cookies[SUPPORT_COOKIE];
+    if (!operation && req.method === 'GET' && !token && !cookie) {
+      sendJson(res, 200, { data: null });
+      return;
+    }
+    const { accounts } = await walletStore();
+    const user = cookie ? await accounts.session(cookie) : null;
+    if (cookie && !user) throw httpError(401, '账号登录已过期，请刷新或重新登录');
+    const viewer = { owner: user?.id, token };
+    const support = accounts.support;
+    if (!operation && req.method === 'GET') {
+      sendJson(res, 200, { data: await support.read(viewer, searchParams.get('summary') === 'true') });
+      return;
+    }
+    if (req.method !== 'POST') throw httpError(405, '不支持的请求方法');
+    if (operation !== 'read' && !checkRateLimit({ id: 'support-' + path + '-' + (user?.id || clientAddress(req)), perMinute: operation === 'reset' ? 5 : 8 }).ok)
+      throw httpError(429, '操作频繁，请稍后再试');
+    const body = await readJsonBody(req);
+    const setGuestCookie = (value, seconds) => ({ 'set-cookie': `${SUPPORT_COOKIE}=${value}; Path=/account-api/support; HttpOnly; SameSite=Lax; Max-Age=${seconds}${isHttpsRequest(req) ? '; Secure' : ''}` });
+    if (operation === 'read') {
+      await support.markRead(viewer, body?.seq);
+      sendJson(res, 200, { ok: true });
+    } else if (operation === 'end') {
+      await support.endGuest(viewer);
+      sendJson(res, 200, { ok: true }, setGuestCookie('', 0));
+    } else if (operation === 'reset') {
+      const { owner, threadId, recoveryCode } = await support.reset(viewer, body?.password);
+      pushAuditLog({ id: randomUUID(), time: new Date().toISOString(), actorKeyId: 'support-session',
+        action: 'reset-password', resource: 'user', target: owner, details: { threadId } });
+      sendJson(res, 200, { recoveryCode });
+    } else {
+      const { data, issued } = await support.send(viewer, body?.message);
+      sendJson(res, 200, { data }, issued ? setGuestCookie(issued, supportSessionTtl) : {});
+    }
+    return;
+  }
+  const sessionProbe = req.method === 'GET' && path === '/account-api/session';
+  if (sessionProbe && authenticateAdminSession(req).ok) {
+    sendJson(res, 200, { role: 'admin', user: superAdminUserPayload() });
+    return;
+  }
+  if (sessionProbe && !cookie) {
+    sendJson(res, 200, { role: null, user: null });
+    return;
+  }
+  const userCookie = (token, seconds) =>
+    USER_COOKIE +
+    '=' +
+    token +
+    '; Path=/account-api/; HttpOnly; SameSite=Lax; Max-Age=' +
+    seconds +
+    (isHttpsRequest(req) ? '; Secure' : '');
+  if (req.method === 'POST' && path === '/account-api/logout') {
+    if (cookie) await (await walletStore()).accounts.logout(cookie);
+    revokeAdminSession(req);
+    sendJson(res, 200, { ok: true }, { 'set-cookie': [userCookie('', 0), clearAdminSessionCookie(req)] });
+    return;
+  }
+  const operations = {
+    '/account-api/register': 'register',
+    '/account-api/login': 'login',
+    '/account-api/recover': 'recover'
+  };
+  if (req.method === 'POST' && Object.hasOwn(operations, path)) {
+    if (!checkRateLimit({ id: 'user-auth-' + clientAddress(req), perMinute: 15 }).ok)
+      throw httpError(429, '尝试次数过多，请稍后再试');
+    const body = await readJsonBody(req);
+    if (!isPlainObject(body)) throw httpError(400, '请提交账号资料');
+    const name = cleanString(body.username);
+    const isAdminName = safeTextEqual(name.toLowerCase(), superAdminUsername().toLowerCase());
+    if (isAdminName && path === '/account-api/register') throw httpError(409, '用户名已被使用');
+    if (isAdminName && path === '/account-api/login' && verifyAdminLogin(req, name, body.password)) {
+      if (cookie) await (await walletStore()).accounts.logout(cookie);
+      sendAdminLogin(req, res, [userCookie('', 0)]);
+      return;
+    }
+    // An existing customer with a matching username can still use their own password.
+    const accounts = (await walletStore()).accounts;
+    const result = await accounts[operations[path]](body);
+    if (cookie) await accounts.logout(cookie);
+    revokeAdminSession(req);
+    sendJson(
+      res,
+      200,
+      { role: 'user', user: result.user, recoveryCode: result.recoveryCode },
+      {
+        'set-cookie': [userCookie(result.token, result.ttl), clearAdminSessionCookie(req)]
+      }
+    );
+    return;
+  }
+  const store = await walletStore();
+  const accounts = store.accounts;
+  const user = await accounts.session(cookie);
+  if (sessionProbe && !user) {
+    sendJson(res, 200, { role: null, user: null }, { 'set-cookie': userCookie('', 0) });
+    return;
+  }
+  if (!user) throw httpError(401, '请登录用户账号');
+  if (!checkRateLimit({ id: 'user-web-' + user.id, perMinute: 120 }).ok) throw httpError(429, '请求过于频繁');
+  const owner = 'user/' + user.id;
+  const keyAction = /^\/account-api\/keys\/([^/]+)\/(secret|rotate)$/.exec(path);
+  if (keyAction) {
+    const [, id, action] = keyAction;
+    if (action === 'secret' && req.method === 'GET') {
+      sendJson(res, 200, { secret: await accounts.keySecret(user.id, id) }, { 'cache-control': 'no-store' });
+      return;
+    }
+    if (action === 'rotate' && req.method === 'POST') {
+      sendJson(res, 200, await accounts.rotateKey(user.id, id), { 'cache-control': 'no-store' });
+      return;
+    }
+    throw httpError(405, '不支持的请求方法');
+  }
+  if (sessionProbe || (req.method === 'GET' && path === '/account-api/me')) {
+    const keys = await accounts.keys(user.id);
+    const models = publicModelList({ accountId: user.id, role: 'service' });
+    const groupIds = new Set([...models.flatMap(model => model.groups), ...keys.map(key => key.modelGroup)]);
+    const groupLabels = Object.fromEntries([...groupIds].flatMap((id) => {
+      const group = Object.hasOwn(config.modelGroups || {}, id) ? config.modelGroups[id] : undefined;
+      return group ? [[id, group.name]] : [];
+    }));
+    sendJson(res, 200, { role: 'user', user, keys, models, groupLabels });
+  } else if (req.method === 'GET' && path === '/account-api/requests') {
+    const keyIds = new Set((await accounts.keys(user.id)).map(key => key.id));
+    sendJson(res, 200, await requestLogPage(searchParams, log => log.accountId === user.id ||
+      (!log.accountId && keyIds.has(log.apiKeyId)), true));
+  } else if (req.method === 'POST' && path === '/account-api/keys') {
+    const body = await readJsonBody(req);
+    const group = body?.modelGroup ?? 'default';
+    const result = await queueConfigSave(() => {
+      const groups = publicModelList({ accountId: user.id, role: 'service' }).flatMap((model) => model.groups);
+      if (!groups.includes(group) || deletingGroups.has(group)) throw httpError(400, '请选择当前已开放的模型分组');
+      const savedGroup = Object.hasOwn(config.modelGroups || {}, group) ? config.modelGroups[group] : undefined;
+      const name = body?.name ?? ((savedGroup?.name || (group === 'default' ? 'API' : group)) + ' Key');
+      return accounts.createKey(user.id, name, group);
+    });
+    sendJson(res, 201, result);
+  } else if (req.method === 'PUT' && /^\/account-api\/keys\/[^/]+$/.test(path)) {
+    const body = await readJsonBody(req);
+    await accounts.renameKey(user.id, path.slice('/account-api/keys/'.length), body?.name);
+    sendJson(res, 200, { ok: true });
+  } else if (req.method === 'DELETE' && path.startsWith('/account-api/keys/')) {
+    await accounts.removeKey(user.id, path.slice('/account-api/keys/'.length));
+    sendJson(res, 200, { ok: true });
+  } else if (req.method === 'GET' && path === '/account-api/wallet') {
+    const includeCancelled = searchParams?.get('includeCancelled') === 'true';
+    sendJson(res, 200, await store.summary(owner, includeCancelled));
+  } else if (
+    (req.method === 'DELETE' && path.startsWith('/account-api/orders/')) ||
+    (req.method === 'POST' && path.startsWith('/account-api/orders/') && path.endsWith('/cancel'))
+  ) {
+    const orderId = path.replace('/account-api/orders/', '').replace('/cancel', '').trim().toUpperCase();
+    if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400, '订单号格式不正确');
+    const result = await store.cancelOrder(owner, orderId);
+    sendJson(res, 200, result);
+  } else if (req.method === 'POST' && path === '/account-api/orders') {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, await store.create(owner, body?.fen, body?.channel, Boolean(paymentImages[CHECKOUT_CHANNEL])));
+  } else throw httpError(404, '没有找到此账户接口');
+}
+
+async function handlePayments(req, res, path, searchParams) {
+  const qrImage = paymentImages[CHECKOUT_CHANNEL];
+  if (path === '/payments/info' && req.method === 'GET') {
+    const usableOnly = searchParams.get('usable') === 'true';
+    const usableList = publicModelList({ accountId: true, role: 'service' });
+    const prices = publishedCnyPrices(usableOnly);
+    const comparisons = {};
+    for (const { id } of usableList) {
+      const routes = availableRoutes(config.models[id], true);
+      if (!routes.length || routes.some(route => route.upstreamModel !== id)) continue;
+      const discount = standardApiDiscount(id, prices[id]);
+      if (discount) comparisons[id] = discount;
+    }
+    const groupsMap = {};
+    for (const [id, g] of Object.entries(config.modelGroups || {})) {
+      groupsMap[id] = g.name || id;
+    }
+    sendJson(res, 200, {
+      channel: CHECKOUT_CHANNEL,
+      enabled: (await (await walletStore()).checkout(Boolean(qrImage))).enabled,
+      priceVersion: config.cnyPricing?.version || PRICE_DATE,
+      prices,
+      standardApiComparison: { ...OPENAI_STANDARD_REFERENCE, models: comparisons },
+      usableModels: usableList.map((m) => m.id),
+      models: usableList,
+      groupNames: groupsMap
+    });
+    return;
+  }
+  if (path === '/payments/wechat/qr' && req.method === 'GET') {
+    const image = await (await walletStore()).qr(qrImage);
+    if (!image) throw httpError(404,'微信收款尚未开放');
+    res.writeHead(200, { 'content-type': image.type });
+    res.end(image.bytes);
+    return;
+  }
+  if (['/payments/alipay/confirm','/payments/wechat/confirm','/payments/confirm'].includes(path) && req.method === 'POST') {
+    // Previously installed WeChat shortcuts use the unqualified endpoint.
+    const channel = path === '/payments/alipay/confirm' ? 'alipay' : 'wechat';
+    const expectedToken = channel === 'wechat' ? wechatReceiptToken : receiptToken;
+    const credential = extractCredential(req);
+    if (expectedToken.length < 32 || !credential.ok || !safeTextEqual(credential.token, expectedToken)) {
+      throw httpError(403, '收款确认凭证无效');
+    }
+    const body = await readJsonBody(req);
+    if (body?.channel !== undefined && body.channel !== channel) throw httpError(400, '收款渠道与核款入口不符');
+    const result = await (await walletStore()).confirm(channel, body || {});
+    sendJson(res, 200, result);
+    return;
+  }
+  if (path.startsWith('/payments/orders/') && req.method === 'DELETE') {
+    const auth = await authenticateProxy(req);
+    if (!auth.ok) throw httpError(auth.status, auth.error);
+    if (auth.key.role !== 'service' || !auth.key.prepaid) throw httpError(403, '请使用已启用预付费的业务 Key');
+    const orderId = path.slice('/payments/orders/'.length).trim().toUpperCase();
+    if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400, '订单号格式不正确');
+    const result = await (await walletStore()).cancelOrder(auth.key.walletId, orderId);
+    sendJson(res, 200, result);
+    return;
+  }
+  if ((path === '/payments/account' && req.method === 'GET') || (path === '/payments/orders' && req.method === 'POST')) {
+    const auth = await authenticateProxy(req);
+    if (!auth.ok) throw httpError(auth.status, auth.error);
+    if (auth.key.role !== 'service' || !auth.key.prepaid) throw httpError(403, '请使用已启用预付费的业务 Key');
+    const owner = auth.key.walletId;
+    if (req.method === 'GET') {
+      const includeCancelled = searchParams?.get('includeCancelled') === 'true';
+      sendJson(res, 200, await (await walletStore()).summary(owner, includeCancelled));
+    } else {
+      const body = await readJsonBody(req);
+      sendJson(res, 200, await (await walletStore()).create(owner, body?.fen, body?.channel, Boolean(qrImage)));
+    }
+    return;
+  }
+  throw httpError(404, '没有找到此收款接口');
+}
+
 async function routeRequest(req, res) {
   setCors(req, res);
   if (req.method === 'OPTIONS') {
@@ -3796,9 +4819,34 @@ async function routeRequest(req, res) {
     return;
   }
 
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-
   try {
+    const url = new URL(req.url || '/', 'http://localhost');
+    if (url.pathname.startsWith('/admin/') || url.pathname.startsWith('/v1/')) {
+      res.setHeader('cache-control', 'no-store');
+    }
+    const shortcut = /^\/shortcuts\/(AlipayReceipt|WechatReceipt)\.shortcut$/.exec(url.pathname);
+    if (shortcut && ['GET', 'HEAD'].includes(req.method)) {
+      const name = shortcut[1];
+      const file = resolve(__dirname, 'shortcuts', name + '.signed');
+      try {
+        const { size } = await stat(file);
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': size,
+          'content-disposition': 'attachment; filename="' + name + '.shortcut"' });
+        res.end(req.method === 'HEAD' ? undefined : await readFile(file));
+        return;
+      } catch {
+        sendJson(res, 404, { error: '快捷指令文件未就绪或未签名' });
+        return;
+      }
+    }
+    if (url.pathname.startsWith('/account-api/')) {
+      await handleAccount(req,res,url.pathname,url.searchParams);
+      return;
+    }
+    if (url.pathname.startsWith('/payments/')) {
+      await handlePayments(req, res, url.pathname, url.searchParams);
+      return;
+    }
     if (url.pathname === '/app-config') {
       if (!['GET', 'HEAD'].includes(req.method)) {
         sendJson(res, 405, { error: 'Only GET is supported for /app-config.' });
@@ -3822,14 +4870,14 @@ async function routeRequest(req, res) {
       if (!requireObserverAccess(req, res)) {
         return;
       }
-      const enabledProviders = Object.entries(config.providers || {}).filter(([, provider]) => provider.enabled !== false);
-      const enabledModels = Object.entries(config.models || {}).filter(([, model]) => model.enabled !== false);
       const defaultModel = config.routing?.defaultModel;
-      const defaultResolution = defaultModel ? resolveModel(defaultModel, 'chat') : { ok: false, error: 'No default model configured.' };
-      const defaultConfiguredRouteCount = defaultResolution.ok
-        ? defaultResolution.candidates.filter((candidate) => providerConfigured(candidate.providerConfig)).length
-        : 0;
-      const ok = !concurrencyState.shuttingDown && enabledProviders.length > 0 && enabledModels.length > 0 && defaultResolution.ok && defaultConfiguredRouteCount > 0;
+      const models = defaultModel ? [config.models?.[defaultModel]] : Object.values(config.models || {});
+      const ok = !concurrencyState.shuttingDown && models.some((model) => {
+        return model && model.enabled !== false && configuredRouteCandidates(model).some(({ provider }) => {
+          const channel = config.providers?.[provider];
+          return channel && channel.enabled !== false && providerConfigured(channel);
+        });
+      });
       sendJson(res, ok ? 200 : 503, {
         ok
       });
@@ -3848,7 +4896,7 @@ async function routeRequest(req, res) {
 
     if (url.pathname === '/' && !SERVE_FRONTEND) {
       sendJson(res, 200, {
-        name: 'JetLinksAPI Gateway',
+        name: 'Wormhole AI Gateway',
         health: '/health',
         ready: '/ready',
         metrics: '/metrics',
@@ -3859,7 +4907,7 @@ async function routeRequest(req, res) {
       return;
     }
 
-    if (url.pathname === '/v1/models' || url.pathname.startsWith('/v1/models/')) {
+    if (url.pathname === '/v1/models' || url.pathname.startsWith('/v1/models/') || url.pathname === '/v1/codex/models') {
       await handleModels(req, res, url);
       return;
     }
@@ -3875,7 +4923,7 @@ async function routeRequest(req, res) {
     }
 
     if (url.pathname.startsWith('/v1/')) {
-      const auth = authenticate(req, { allowAdminSession: true });
+      const auth = await authenticateProxy(req, { allowAdminSession: true });
       if (!auth.ok) {
         sendJson(res, auth.status, { error: auth.error });
         return;
@@ -3890,7 +4938,11 @@ async function routeRequest(req, res) {
 
     sendJson(res, 404, { error: 'Not found.' });
   } catch (error) {
-    sendJson(res, error.status || 500, { error: error.message });
+    const status = error.status || 500;
+    if (status >= 500 && /^\/(?:account-api\/|payments\/|admin\/support(?:\/|\?|$))/.test(req.url || '')) {
+      console.error('Account or wallet operation failed', error.code || status);
+      sendJson(res, status, { error: '账户或收款服务暂不可用，请稍后重试' });
+    } else sendJson(res, status, { error: error.message });
   }
 }
 
@@ -3905,10 +4957,10 @@ function beginGracefulShutdown(signal) {
   }
   shutdownStarted = true;
   concurrencyState.shuttingDown = true;
-  console.log(`JetLinksAPI Gateway received ${signal}; draining in-flight requests.`);
+  console.log(`Wormhole AI Gateway received ${signal}; draining in-flight requests.`);
   const timeoutMs = Number(config.limits?.gracefulShutdownTimeoutMs || 30_000);
   const forceTimer = setTimeout(() => {
-    console.error(`JetLinksAPI Gateway forced shutdown after ${timeoutMs}ms.`);
+    console.error(`Wormhole AI Gateway forced shutdown after ${timeoutMs}ms.`);
     process.exit(1);
   }, timeoutMs);
   forceTimer.unref();
@@ -3919,14 +4971,14 @@ function beginGracefulShutdown(signal) {
         try {
           await postgresPool.end();
         } catch (closeError) {
-          console.error(`JetLinksAPI Gateway PostgreSQL shutdown error: ${closeError.message}`);
+          console.error(`Wormhole AI Gateway PostgreSQL shutdown error: ${closeError.message}`);
         }
       }
       if (error) {
-        console.error(`JetLinksAPI Gateway shutdown error: ${error.message}`);
+        console.error(`Wormhole AI Gateway shutdown error: ${error.message}`);
         process.exit(1);
       }
-      console.log('JetLinksAPI Gateway shutdown complete.');
+      console.log('Wormhole AI Gateway shutdown complete.');
       process.exit(0);
     })();
   });
@@ -3936,7 +4988,7 @@ server.listen(port, host, () => {
   const mode = configState.persistent
     ? `storage=${configState.driver || STORAGE_DRIVER} config=${configState.path}`
     : `storage=${configState.driver || STORAGE_DRIVER} config=${configState.path} (not persisted)`;
-  console.log(`JetLinksAPI Gateway listening on http://${host}:${port} ${mode}`);
+  console.log(`Wormhole AI Gateway listening on http://${host}:${port} ${mode}`);
   if (!configState.persistent) {
     console.log(`First successful admin write will create ${configState.path}.`);
   }

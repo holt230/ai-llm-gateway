@@ -1,0 +1,44 @@
+name: wormhole-ai
+
+services:
+  gateway:
+    image: ghcr.io/holt230/ai-llm-gateway:${WORMHOLE_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    stop_grace_period: 40s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WORMHOLE_PORT:-5100}:5100"
+    env_file: .env.production
+    environment:
+      HOST: 0.0.0.0
+      PORT: "5100"
+      AI_GW_SERVE_FRONTEND: "true"
+      AI_GW_PERSISTENCE: postgres
+      AI_GW_DATABASE_URL: postgresql://wormhole@postgres:5432/wormhole
+      PGPASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}"
+      AI_GW_SUPER_ADMIN_PASSWORD: "${AI_GW_SUPER_ADMIN_PASSWORD:?Set AI_GW_SUPER_ADMIN_PASSWORD in .env.production}"
+      AI_GW_API_KEY_PEPPER: "${AI_GW_API_KEY_PEPPER:?Set AI_GW_API_KEY_PEPPER in .env.production}"
+      AI_GW_PROVIDER_SECRET_KEY: "${AI_GW_PROVIDER_SECRET_KEY:?Set AI_GW_PROVIDER_SECRET_KEY in .env.production}"
+      AI_GW_USER_KEY_SECRET: "${AI_GW_USER_KEY_SECRET:?Set AI_GW_USER_KEY_SECRET in .env.production}"
+      AI_GW_PUBLIC_BASE_URL: "${AI_GW_PUBLIC_BASE_URL:?Set AI_GW_PUBLIC_BASE_URL in .env.production}"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wormhole
+      POSTGRES_USER: wormhole
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres-data:

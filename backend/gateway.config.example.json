@@ -3,21 +3,9 @@
     "host": "0.0.0.0",
     "port": 8787
   },
-  "publicBaseUrl": "https://ai-gw.jetlinks.cn",
+  "publicBaseUrl": "https://1024012.xyz",
   "auth": {
-    "internalApiKeys": [
-      {
-        "id": "admin-dev",
-        "name": "System Admin",
-        "key": "dev-internal-key",
-        "role": "admin",
-        "system": true,
-        "enabled": true,
-        "perMinute": 120,
-        "allowedModels": ["*"],
-        "allowedEndpoints": ["*"]
-      }
-    ]
+    "internalApiKeys": []
   },
   "providers": {},
   "models": {},
@@ -28,18 +16,7 @@
   },
   "pricing": {
     "currency": "USD",
-    "models": {
-      "jetlinks-image": {
-        "billingUnit": "image",
-        "currency": "CNY",
-        "imageUnitPrice": 0.5,
-        "unitLabel": "image",
-        "officialProvider": "aliyun",
-        "officialModel": "qwen-image-2.0-pro",
-        "source": "https://help.aliyun.com/zh/model-studio/model-pricing",
-        "note": "阿里云百炼华北2北京：按成功生成图像张数计费，请求失败不计费。"
-      }
-    }
+    "models": {}
   },
   "limits": {
     "maxInFlightRequests": 200,

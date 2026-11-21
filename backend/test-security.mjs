@@ -15,12 +15,14 @@ const requestLogPath = join(tempDir, 'requests.jsonl');
 const auditLogPath = join(tempDir, 'audit.jsonl');
 const allowedOrigin = 'http://console.jetlinks.local';
 const runtimePublicBaseUrl = 'https://runtime-gateway.jetlinks.local';
+const backendOnly = process.argv.includes('--backend-only');
 
 const config = {
   server: { host: '127.0.0.1', port },
   publicBaseUrl: 'https://ai-gw.jetlinks.cn',
   auth: {
     internalApiKeys: [
+      { id: 'admin-dev', key: 'dev-internal-key', role: 'admin' },
       {
         id: 'admin-security',
         name: 'Security Admin',
@@ -83,6 +85,7 @@ const child = spawn(process.execPath, ['backend/server.mjs'], {
     ...process.env,
     HOST: '127.0.0.1',
     PORT: String(port),
+    NODE_ENV: 'production',
     AI_GW_PERSISTENCE: 'file',
     AI_GW_GATEWAY_CONFIG: configPath,
     AI_GW_GATEWAY_REQUEST_LOG: requestLogPath,
@@ -93,8 +96,7 @@ const child = spawn(process.execPath, ['backend/server.mjs'], {
     AI_GW_SUPER_ADMIN_NAME: 'Security Admin',
     AI_GW_PUBLIC_BASE_URL: runtimePublicBaseUrl,
     AI_GW_ADMIN_LOGIN_PER_MINUTE: '5',
-    AI_GW_DISABLE_DEV_KEYS: 'true',
-    AI_GW_SERVE_FRONTEND: 'true'
+    AI_GW_SERVE_FRONTEND: backendOnly ? 'false' : 'true'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -154,6 +156,9 @@ try {
 
   const noAuthAdmin = await raw('/admin/models');
   assert.equal(noAuthAdmin.status, 401);
+
+  const disabledDevKey = await raw('/admin/models', { apiKey: 'dev-internal-key' });
+  assert.equal(disabledDevKey.status, 401);
 
   const serviceCannotAdmin = await raw('/admin/models', { apiKey: 'service-test-key' });
   assert.equal(serviceCannotAdmin.status, 403);
@@ -342,9 +347,11 @@ try {
   });
   assert.equal(spoofedLoginLimit.status, 429);
 
-  await assertBuiltFrontendDoesNotExposeDefaults();
+  if (!backendOnly) {
+    await assertBuiltFrontendDoesNotExposeDefaults();
+  }
 
-  console.log('security smoke tests passed');
+  console.log(backendOnly ? 'backend security smoke tests passed' : 'security smoke tests passed');
 } finally {
   child.kill('SIGTERM');
   await delay(100);

@@ -1,6 +1,9 @@
 node_modules
 dist
 .playwright-mcp
+.codegraph
+.cursor
+.github
 .git
 .agents
 .codex
