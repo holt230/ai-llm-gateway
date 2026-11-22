@@ -16,6 +16,8 @@ type Order = {
   deleted: string | null;
   owner?: string | null;
   username?: string | null;
+  serviceKeyName?: string | null;
+  transactionId?: string | null;
 };
 
 export function PaymentAdmin({ base, publicBaseUrl, english }: { base: string; publicBaseUrl: string; english: boolean }) {
@@ -63,6 +65,7 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
   const [filter, setFilter] = useState<'all' | 'pending' | 'paid' | 'cancelled'>('all');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<Order>();
+  const [details, setDetails] = useState<{ order: Order; trigger: HTMLButtonElement }>();
   const [amount, setAmount] = useState('');
   const [receipt, setReceipt] = useState('');
   const [busy, setBusy] = useState(false);
@@ -143,6 +146,16 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
       await api('settings', 'PUT', { enabled: !settings?.enabled });
       setSettings(await api<Settings>('settings'));
     });
+  const ownerLabel = (order: Order) => order.username || order.serviceKeyName || (
+    order.owner?.startsWith('user/') ? t('账号不可用', 'Account unavailable') : t('历史业务 Key', 'Legacy service key')
+  );
+  const statusLabel = (order: Order) => order.paid ? t('已入账', 'Credited') : order.deleted ? t('已取消', 'Cancelled') : t('待核款', 'Pending');
+  const amountLabel = (order: Order) => order.fen === null ? t('按实收入账', 'Actual amount') : '¥' + (order.fen / 100).toFixed(2);
+  const showDetails = (id: string, trigger: HTMLButtonElement) => run(async () => {
+    const { orders } = await api<{ orders: Order[] }>('orders?id=' + encodeURIComponent(id));
+    if (!orders[0]) throw new Error(t('未找到这笔订单，请刷新列表。', 'This order is no longer available. Refresh the list.'));
+    setDetails({ order: orders[0], trigger });
+  });
   const remove = async (order: Order) => {
     if (!await askConfirmation(t(
       `删除/取消订单 ${order.id}？请先确认收款账单上没有这笔付款。若之后收到款项，可按订单号找回并核款。`,
@@ -327,7 +340,7 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
             <TableHeader>
               <TableRow>
                 <TableHead scope="col">{t('订单 / 创建时间', 'Order / Time')}</TableHead>
-                <TableHead scope="col">{t('关联用户', 'User')}</TableHead>
+                <TableHead scope="col">{t('用户名 / 业务 Key', 'Username / Service key')}</TableHead>
                 <TableHead scope="col">{t('订单金额', 'Order amount')}</TableHead>
                 <TableHead scope="col">{t('状态', 'Status')}</TableHead>
                 <TableHead scope="col" className="text-right">{t('操作', 'Actions')}</TableHead>
@@ -341,30 +354,27 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
                     <time className="block text-xs text-muted-foreground">{new Date(o.created).toLocaleString()}</time>
                   </TableCell>
                   <TableCell>
-                    {o.username ? (
-                      <span className="font-medium text-xs">{o.username}</span>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">{o.owner ? o.owner.slice(0, 8) + '...' : t('未绑定', 'Unbound')}</span>
-                    )}
+                    <span className={`text-xs wrap-anywhere ${o.username || o.serviceKeyName ? 'font-medium' : 'text-muted-foreground'}`}>
+                      {ownerLabel(o)}
+                    </span>
                   </TableCell>
                   <TableCell>
                     <strong className="font-medium tabular-nums">
-                      {o.fen === null ? t('按实收入账', 'Actual amount') : '¥' + (o.fen / 100).toFixed(2)}
+                      {amountLabel(o)}
                     </strong>
                   </TableCell>
                   <TableCell>
                     <span className={`status-badge ${o.paid ? 'active' : o.deleted ? 'paused' : 'slow'}`}>
-                      {o.paid ? t('已入账', 'Credited') : o.deleted ? t('已取消', 'Cancelled') : t('待核款', 'Pending')}
+                      {statusLabel(o)}
                     </span>
                   </TableCell>
                   <TableCell className="text-right">
-                    {o.paid ? (
-                      <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                        <CheckCircle2 size={13} className="text-emerald-500" />
-                        {t('已入账', 'Credited')}
-                      </span>
-                    ) : (
-                      <div className="inline-flex items-center justify-end gap-1">
+                    <div className="inline-flex items-center justify-end gap-1 whitespace-nowrap">
+                      <Button variant="ghost" size="sm" type="button" disabled={busy}
+                        onClick={(event) => void showDetails(o.id, event.currentTarget)}>
+                        {t('查看详情', 'View details')}
+                      </Button>
+                      {!o.paid && (<>
                         <Button
                           variant="ghost"
                           size="icon-sm"
@@ -397,8 +407,8 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
                             <Trash2 size={15} />
                           </Button>
                         )}
-                      </div>
-                    )}
+                      </>)}
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -406,6 +416,29 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
           </Table>
         ) : (
           !busy && <p className="overview-empty">{t('没有匹配的订单', 'No matching orders')}</p>
+        )}
+        {details && (
+          <FormDialog title={t('充值订单详情', 'Top-up order details')} closeLabel={t('关闭', 'Close')}
+            description={`${channelName} · ${statusLabel(details.order)}`} drawer
+            onClose={() => setDetails(undefined)} returnFocus={() => details.trigger}>
+            <dl className={dialogBody}>
+              {[
+                [t('网站订单号', 'Website order number'), details.order.id, true],
+                [details.order.username ? t('用户名', 'Username') : t('业务 Key', 'Service key'), ownerLabel(details.order)],
+                [active ? t('微信支付单号', 'WeChat Pay transaction number') : t('支付宝交易号', 'Alipay transaction number'),
+                  details.order.transactionId || t('未记录', 'Not recorded'), Boolean(details.order.transactionId)],
+                [details.order.paid ? t('实收金额', 'Amount received') : t('订单金额', 'Order amount'), amountLabel(details.order)],
+                [t('创建时间', 'Created at'), new Date(details.order.created).toLocaleString()],
+                ...(details.order.paid ? [[t('入账时间', 'Credited at'), new Date(details.order.paid).toLocaleString()]] : []),
+                ...(details.order.deleted ? [[t('取消时间', 'Cancelled at'), new Date(details.order.deleted).toLocaleString()]] : [])
+              ].map(([label, value, code]) => (
+                <div key={String(label)}>
+                  <dt className="text-sm text-muted-foreground">{label}</dt>
+                  <dd className="m-0 mt-1 wrap-anywhere text-sm font-medium">{code ? <code>{value}</code> : value}</dd>
+                </div>
+              ))}
+            </dl>
+          </FormDialog>
         )}
         {selected && (
           <FormDialog title={t('核对网站订单', 'Verify order')} closeLabel={t('关闭', 'Close')} busy={busy} onClose={closeReceipt}

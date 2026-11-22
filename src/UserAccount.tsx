@@ -23,6 +23,7 @@ import {
   Ellipsis,
   Eye,
   EyeOff,
+  ImagePlus,
   KeyRound,
   Layers3,
   LockKeyhole,
@@ -30,18 +31,17 @@ import {
   Play,
   Plus,
   RefreshCcw,
-  ShieldCheck,
   Sparkles,
   Trash2,
   UserRound,
-  Wallet,
-  Zap
+  Wallet
 } from 'lucide-react';
 import { TestModelCall } from './TestModelCall';
 import { AccountPricing } from './WalletPricing';
 import { RequestLogs } from './RequestLogs';
 import { WalletAccount } from './WalletPage';
 import { Playground } from './Playground';
+import { ImageStudio } from './ImageStudio';
 import type { AdminSession, CustomerDashboard, CustomerKey, CustomerRoute, SignedIn } from './customer-session';
 
 type Props = {
@@ -89,7 +89,7 @@ export function UserAccount({
   const showPassword = visiblePasswordFor === mode;
   const [recovery, setRecovery] = useState('');
   const [newRecovery, setNewRecovery] = useState<{ owner: string; value: string }>();
-  const validAreas = ['wallet', 'models', 'keys', 'playground', 'logs'] as const;
+  const validAreas = ['wallet', 'models', 'keys', 'playground', 'images', 'logs'] as const;
   type Area = (typeof validAreas)[number];
   const [selectedPlaygroundModel, setSelectedPlaygroundModel] = useState<string>('');
   const [area, setAreaState] = useState<Area>(() => {
@@ -297,103 +297,54 @@ export function UserAccount({
         {/* Master Card Container: Two-column split showcase on desktop (lg+), clean compact card on mobile */}
         <div className="w-full max-w-5xl rounded-3xl border border-border/70 bg-card/95 shadow-[0_24px_64px_-16px_rgba(23,32,40,0.12)] backdrop-blur-xl overflow-hidden grid grid-cols-1 lg:grid-cols-12">
 
-          {/* Left Column: Developer Showcase & Value Proposition (Desktop only) */}
-          <section className="hidden lg:flex lg:col-span-6 xl:col-span-7 flex-col justify-between p-8 xl:p-10 bg-gradient-to-br from-[#121418] via-[#16181e] to-[#0f1013] text-white relative overflow-hidden border-b lg:border-b-0 lg:border-r border-zinc-800/80">
-            {/* Ambient lighting inside dark showcase panel */}
-            <div className="pointer-events-none absolute -right-20 -top-20 size-72 rounded-full bg-amber-500/10 blur-3xl" />
-            <div className="pointer-events-none absolute -left-20 -bottom-20 size-72 rounded-full bg-primary/10 blur-3xl" />
+          <section aria-labelledby="auth-workspace-title" className="relative hidden flex-col overflow-hidden border-r border-zinc-800/80 bg-gradient-to-br from-[#121418] via-[#16181e] to-[#0f1013] p-8 text-white lg:col-span-6 lg:flex xl:col-span-7 xl:p-10">
+            <div aria-hidden="true" className="pointer-events-none absolute -right-20 -top-20 size-72 rounded-full bg-amber-500/10 blur-3xl" />
+            <div aria-hidden="true" className="pointer-events-none absolute -left-20 -bottom-20 size-72 rounded-full bg-primary/10 blur-3xl" />
 
-            {/* Top Brand & Status */}
-            <div className="relative z-10 flex items-center justify-between gap-3">
+            <div className="relative flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-3">
-                <img src="/favicon.svg" alt="Wormhole AI" className="size-9 rounded-xl shadow-xs" />
+                <img src="/favicon.svg" alt="" className="size-9 rounded-xl shadow-xs" />
                 <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-base font-bold tracking-tight text-white">Wormhole AI</span>
-                    <span className="rounded-full bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
-                      Gateway
-                    </span>
-                  </div>
-                  <p className="m-0 text-xs text-zinc-400">
-                    {t('大模型统一聚合路由基础设施', 'Frontier AI Model Gateway Infrastructure')}
-                  </p>
+                  <div className="text-base font-bold tracking-tight">Wormhole AI</div>
+                  <p className="m-0 text-xs text-zinc-400">{t('大模型工作台', 'AI model workspace')}</p>
                 </div>
               </div>
-
-              <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 text-[11px] font-medium text-emerald-400">
-                <span className="size-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                <span>{t('API 运行正常', 'API Operational')}</span>
-              </div>
+              <span className="rounded-full border border-amber-500/25 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300">
+                {t('按用量计费', 'Pay as you go')}
+              </span>
             </div>
 
-            {/* Middle: Value Prop & Stylized API Terminal */}
-            <div className="relative z-10 my-8 space-y-6">
+            <div className="relative mt-8 flex flex-1 flex-col justify-center gap-6">
               <div>
-                <h2 className="text-xl xl:text-2xl font-bold tracking-tight text-white leading-snug">
-                  {t('统一接入全球前沿大模型', 'Unified Access to Frontier AI Models')}
+                <h2 id="auth-workspace-title" className="m-0 text-xl leading-snug font-semibold tracking-tight xl:text-2xl">
+                  {t('一个账号，使用多种模型', 'One account for multiple AI models')}
                 </h2>
-                <p className="mt-2 text-sm text-zinc-300 leading-relaxed max-w-[46ch]">
-                  {t(
-                    '标准 OpenAI 协议全适配，提供毫秒级智能调度、跨供应商自动容灾与企业级隔离鉴权。',
-                    'OpenAI-compatible protocol with sub-second routing, cross-provider failover, and enterprise tenant isolation.'
-                  )}
+                <p className="mt-2 mb-0 max-w-[48ch] text-sm leading-relaxed text-zinc-300">
+                  {t('选模型、测效果、查用量，都在同一个工作台。', 'Choose a model, test it, and track usage in one workspace.')}
                 </p>
               </div>
 
-              {/* Terminal Code Mockup */}
-              <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 shadow-inner font-mono text-xs overflow-hidden">
-                <div className="flex items-center justify-between border-b border-zinc-800/80 bg-zinc-900/60 px-3.5 py-2">
-                  <div className="flex items-center gap-1.5">
-                    <span className="size-2.5 rounded-full bg-[#ff5f56]" />
-                    <span className="size-2.5 rounded-full bg-[#ffbd2e]" />
-                    <span className="size-2.5 rounded-full bg-[#27c93f]" />
-                    <span className="ms-2 text-[11px] text-zinc-400 font-sans">OpenAI Compatible</span>
-                  </div>
-                  <span className="text-[10px] text-zinc-400">POST /v1/chat/completions</span>
-                </div>
-                <div className="p-3.5 space-y-1 text-zinc-300 leading-relaxed overflow-x-auto text-[11px]">
-                  <div className="text-zinc-400"># {t('零迁移成本，无缝切换主流大模型', 'Zero migration cost, plug-and-play')}</div>
-                  <div><span className="text-amber-400 font-semibold">curl</span> <span className="text-zinc-200">https://1024012.xyz/v1/chat/completions</span> \</div>
-                  <div className="ps-4"><span className="text-zinc-400">-H</span> <span className="text-sky-300">&quot;Authorization: Bearer wk-live-••••••••&quot;</span> \</div>
-                  <div className="ps-4"><span className="text-zinc-400">-d</span> <span className="text-zinc-300">&apos;&#123;&quot;model&quot;: &quot;gpt-6.2-astra&quot;, &quot;stream&quot;: true&#125;&apos;</span></div>
-                </div>
-                <div className="flex items-center justify-between border-t border-zinc-800/60 bg-zinc-900/40 px-3 py-1.5 text-[10px] text-zinc-400">
-                  <span className="flex items-center gap-1 text-emerald-400">
-                    <span className="size-1 rounded-full bg-emerald-400" />
-                    <span>HTTP 200 OK</span>
-                  </span>
-                  <span>{t('18ms 调度时延 · 零明文留存', '18ms latency · Zero retention')}</span>
-                </div>
-              </div>
-
-              {/* Core Feature Badges */}
-              <div className="grid grid-cols-3 gap-2.5 pt-1">
-                <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/50 p-3">
-                  <ShieldCheck size={18} className="text-amber-400 mb-1.5" />
-                  <div className="text-xs font-semibold text-zinc-200">{t('端到端隔离', 'Isolated Keys')}</div>
-                  <div className="text-[11px] text-zinc-400 mt-0.5 leading-snug">{t('凭证独立隔离鉴权', 'Per-tenant segregation')}</div>
-                </div>
-                <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/50 p-3">
-                  <Layers3 size={18} className="text-sky-400 mb-1.5" />
-                  <div className="text-xs font-semibold text-zinc-200">{t('多模型路由', 'Smart Routing')}</div>
-                  <div className="text-[11px] text-zinc-400 mt-0.5 leading-snug">{t('毫秒级故障自动容灾', 'Sub-second auto failover')}</div>
-                </div>
-                <div className="rounded-xl border border-zinc-800/90 bg-zinc-900/50 p-3">
-                  <Zap size={18} className="text-amber-400 mb-1.5" />
-                  <div className="text-xs font-semibold text-zinc-200">{t('秒级计费', 'Live Billing')}</div>
-                  <div className="text-[11px] text-zinc-400 mt-0.5 leading-snug">{t('按 Token 精确透明核算', 'Transparent per-token')}</div>
-                </div>
-              </div>
-            </div>
-
-            {/* Bottom Footer Info */}
-            <div className="relative z-10 flex items-center justify-between text-xs text-zinc-400 pt-3 border-t border-zinc-800/60">
-              <span>{t('全球多可用区部署 · SLA 99.99%', 'Multi-region deployment · SLA 99.99%')}</span>
-              <span>{t('256 位 TLS 传输加密', '256-bit TLS encrypted')}</span>
+              <Card className="border-white/10 bg-zinc-950/40 text-zinc-100">
+                <ul className="m-0 list-none divide-y divide-white/10 px-4 py-0">
+                  {[
+                    { icon: Layers3, title: t('模型与价格', 'Models and pricing'), detail: t('查看当前可用的模型和人民币价格。', 'See which models are available and what they cost in CNY.') },
+                    { icon: Play, title: t('在线测试', 'Test online'), detail: t('在工作台发起调用，直接查看模型回复。', 'Send a test request and read the model’s response in the workspace.') },
+                    { icon: Wallet, title: t('余额与记录', 'Balance and history'), detail: t('充值、查余额，也能查看每次调用的用量。', 'Top up, check your balance, and see usage for each request.') }
+                  ].map(({ icon: Icon, title, detail }) => (
+                    <li key={title} className="flex items-center gap-3 py-3">
+                      <Icon aria-hidden="true" size={18} className="shrink-0 text-amber-300" />
+                      <div className="min-w-0">
+                        <p className="m-0 text-sm font-medium">{title}</p>
+                        <p className="mt-0.5 mb-0 text-xs leading-relaxed text-zinc-400">{detail}</p>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
             </div>
           </section>
 
-          {/* Right Column: Auth Form Area */}
+          {/* Account form */}
           <section aria-labelledby="auth-title" className="col-span-12 lg:col-span-6 xl:col-span-5 flex flex-col justify-between p-6 sm:p-9 xl:p-10 bg-card">
             <div>
               {/* Mobile-only brand badge */}
@@ -406,17 +357,17 @@ export function UserAccount({
               <header className="mb-6">
                 <h1 id="auth-title" className="m-0 text-2xl font-bold tracking-tight text-foreground sm:text-2xl">
                   {registering
-                    ? t('创建开发者账号', 'Create an account')
+                    ? t('创建账号', 'Create an account')
                     : recovering
                       ? t('找回密码', 'Reset your password')
                       : t('登录工作台', 'Sign in to workspace')}
                 </h1>
                 <p className="mt-1.5 mb-0 text-sm leading-relaxed text-muted-foreground">
                   {registering
-                    ? t('创建账号后即可在工作台查看可用模型并管理密钥。', 'Create an account to browse available models and manage keys.')
+                    ? t('注册后可查看模型和价格，开始在线测试。', 'Create an account to browse models and pricing and start testing online.')
                     : recovering
                       ? t('使用注册时保存的恢复码设置新密码。', 'Use the recovery code you saved when you registered.')
-                      : t('使用你的账号进入工作台，管理 API 与模型调用。', 'Sign in with your account to access your workspace and API keys.')}
+                      : t('登录后查看余额、管理密钥和调用记录。', 'Sign in to check your balance, manage keys, and review request history.')}
                 </p>
               </header>
 
@@ -608,11 +559,12 @@ export function UserAccount({
               )}
             </div>
 
-            {/* Bottom Security / Privacy Assurance */}
-            <div className="mt-8 pt-5 border-t border-border/50 flex items-center justify-center gap-2 text-xs text-muted-foreground">
-              <ShieldCheck size={14} className="text-muted-foreground/70 shrink-0" />
-              <span>{t('256 位 TLS 传输加密 · 严格数据隔离 · 不存储模型提示词', '256-bit TLS encryption · strict tenant isolation · zero prompt logging')}</span>
-            </div>
+            {registering && (
+              <p className="mt-8 mb-0 flex items-start gap-2 border-t border-border/60 pt-4 text-xs leading-relaxed text-muted-foreground">
+                <KeyRound size={14} aria-hidden="true" className="mt-0.5 shrink-0" />
+                <span>{t('注册成功后，请保存恢复码，以便找回密码。', 'Save your recovery code after signing up so you can reset your password.')}</span>
+              </p>
+            )}
           </section>
         </div>
       </main>
@@ -634,7 +586,7 @@ export function UserAccount({
       )}
       {me && (
         <>
-          <nav className="grid grid-cols-2 gap-1 rounded-xl border border-border bg-muted p-1 sm:grid-cols-5" aria-label={t('工作台导航', 'Workspace navigation')}>
+          <nav className="grid grid-cols-2 gap-1 rounded-xl border border-border bg-muted p-1 sm:grid-cols-3 lg:grid-cols-6" aria-label={t('工作台导航', 'Workspace navigation')}>
             <Button variant="ghost" size="lg" className={workspaceTab} aria-current={area === 'wallet' ? 'page' : undefined} onClick={() => setArea('wallet')}>
               <Wallet size={18} />
               {t('钱包与充值', 'Wallet & top-ups')}
@@ -650,6 +602,9 @@ export function UserAccount({
             <Button variant="ghost" size="lg" className={workspaceTab} aria-current={area === 'playground' ? 'page' : undefined} onClick={() => setArea('playground')}>
               <Play size={18} />
               {t('在线调试', 'Playground')}
+            </Button>
+            <Button variant="ghost" size="lg" className={workspaceTab} aria-current={area === 'images' ? 'page' : undefined} onClick={() => setArea('images')}>
+              <ImagePlus size={18} />{t('图片创作', 'Image studio')}
             </Button>
             <Button variant="ghost" size="lg" className={workspaceTab} aria-current={area === 'logs' ? 'page' : undefined} onClick={() => setArea('logs')}>
               <Activity size={17} />{t('调用日志', 'Request logs')}
@@ -887,11 +842,10 @@ export function UserAccount({
                         {t('前往在线调试台', 'Open playground')}
                       </Button>
                       <TestModelCall
-                        key={group}
                         base={base}
-                        models={groupModels}
+                        models={models}
                         english={english}
-                        issued={issuedKey?.modelGroup === group ? secret?.value : undefined}
+                        keySource={{ keys: me.keys, groupLabel, getSecret: getKey }}
                         onCharged={() => setWalletRevision((n) => n + 1)}
                       />
                     </div>
@@ -923,15 +877,17 @@ export function UserAccount({
           {area === 'playground' && (
             <Playground
               base={base}
-              models={models.map((m) => ({ id: m.id, endpoints: m.endpoints, group: groupLabel(m.groups[0] || '') }))}
+              models={models.map((m) => ({ id: m.id, endpoints: m.endpoints, groups: m.groups, group: groupLabel(m.groups[0] || '') }))}
               selectedModelId={selectedPlaygroundModel}
               onModelSelect={setSelectedPlaygroundModel}
-              keys={me.keys}
-              activeSecret={secret?.value}
+              keySource={{ keys: me.keys, groupLabel, getSecret: getKey, onManage: () => setArea('keys') }}
               onCharged={() => setWalletRevision((n) => n + 1)}
               english={english}
             />
           )}
+          {area === 'images' && <ImageStudio key={me.user.id} base={base} t={t}
+            keySource={{ keys: me.keys, groupLabel, getSecret: getKey, onManage: () => setArea('keys') }}
+            onCharged={() => setWalletRevision(n => n + 1)} />}
           {area === 'models' && (
             <>
               <Card as="section" className="panel catalog-workspace" aria-label={t('可用模型', 'Available models')}>

@@ -4011,7 +4011,15 @@ async function handleAdmin(req, res, url) {
       const orderId = (url.searchParams.get('id') || '').trim().toUpperCase();
       const filter = (url.searchParams.get('filter') || 'pending').trim().toLowerCase();
       if (orderId && !/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400,'请输入完整的 12 位网站订单号');
-      sendJson(res,200,{orders:await store.receiptOrders(orderId,channel,filter)});
+      const serviceKeyNames = new Map((config.auth.internalApiKeys || [])
+        .filter(key => key.role === 'service' && key.walletId)
+        .map(key => [key.walletId, key.name]));
+      const orders = (await store.receiptOrders(orderId,channel,filter)).map(({ receipt, ...order }) => ({
+        ...order,
+        serviceKeyName: serviceKeyNames.get(order.owner) || null,
+        ...(orderId ? { transactionId: receipt?.replace(/^alipay:/, '') || null } : {})
+      }));
+      sendJson(res,200,{orders});
     } else if (req.method === 'DELETE' && path === 'orders') {
       const orderId = (url.searchParams.get('id') || '').trim().toUpperCase();
       if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400,'请输入完整的 12 位网站订单号');
@@ -4717,6 +4725,10 @@ async function handleAccount(req, res, path, searchParams) {
   } else if (req.method === 'DELETE' && path.startsWith('/account-api/keys/')) {
     await accounts.removeKey(user.id, path.slice('/account-api/keys/'.length));
     sendJson(res, 200, { ok: true });
+  } else if (req.method === 'GET' && path === '/account-api/wallet/usage') {
+    const days = searchParams.get('days') ?? '7';
+    if (days !== '7' && days !== '30') throw httpError(400, '统计范围仅支持 7 天或 30 天');
+    sendJson(res, 200, await store.usageSummary(owner, Number(days)), { 'cache-control': 'no-store' });
   } else if (req.method === 'GET' && path === '/account-api/wallet') {
     const includeCancelled = searchParams?.get('includeCancelled') === 'true';
     sendJson(res, 200, await store.summary(owner, includeCancelled));

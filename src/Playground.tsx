@@ -1,9 +1,10 @@
-import { useState, useId, useMemo, useRef, useEffect, FormEvent } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 import { Card } from './components/ui/card';
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
 import { Textarea } from './components/ui/textarea';
 import { SelectField } from './components/ui/select-field';
+import { SavedTestKey, eligibleTestKeys, type TestKeySource } from './SavedTestKey';
 import {
   Play,
   Send,
@@ -16,9 +17,7 @@ import {
   Cpu,
   RotateCcw,
   AlertCircle,
-  KeyRound,
-  ChevronDown,
-  Layers3
+  ChevronDown
 } from 'lucide-react';
 import { writeClipboard } from './clipboard';
 
@@ -28,12 +27,7 @@ export type UnifiedModel = {
   endpoints?: string[];
   provider?: string;
   group?: string;
-};
-
-export type PlaygroundKey = {
-  id: string;
-  name: string;
-  preview: string;
+  groups?: string[];
 };
 
 export type PlaygroundProps = {
@@ -42,8 +36,7 @@ export type PlaygroundProps = {
   selectedModelId?: string;
   onModelSelect?: (modelId: string) => void;
   // Customer mode
-  keys?: PlaygroundKey[];
-  activeSecret?: string;
+  keySource?: TestKeySource;
   onCharged?: () => void;
   // Admin mode
   isAdmin?: boolean;
@@ -64,8 +57,7 @@ export function Playground({
   models,
   selectedModelId,
   onModelSelect,
-  keys = [],
-  activeSecret = '',
+  keySource,
   onCharged,
   isAdmin = false,
   serviceApiKey = '',
@@ -79,20 +71,18 @@ export function Playground({
     return models.filter((m) => m.id && (!m.endpoints || m.endpoints.some((e) => ['*', 'chat', 'responses', 'embeddings'].includes(e))));
   }, [models]);
 
-  const [currentModel, setCurrentModel] = useState<string>(() => {
-    if (selectedModelId && validModels.some((m) => m.id === selectedModelId)) return selectedModelId;
-    return validModels[0]?.id || '';
-  });
+  const defaultModel = (keySource && validModels.find(model => eligibleTestKeys(keySource, model.groups).length)?.id)
+    || validModels[0]?.id || '';
+  const preferredModel = validModels.some(model => model.id === selectedModelId) ? selectedModelId : undefined;
+  const [currentModel, setCurrentModel] = useState(preferredModel || defaultModel);
 
   useEffect(() => {
-    if (selectedModelId && validModels.some((m) => m.id === selectedModelId)) {
-      setCurrentModel(selectedModelId);
-    }
-  }, [selectedModelId, validModels]);
+    setCurrentModel(current => preferredModel || (validModels.some(model => model.id === current) ? current : defaultModel));
+  }, [preferredModel, defaultModel, validModels]);
 
   const [mode, setMode] = useState<'chat' | 'raw'>('chat');
-  const [apiKeyInput, setApiKeyInput] = useState<string>(activeSecret || serviceApiKey || '');
-  const [selectedKeyId, setSelectedKeyId] = useState<string>(keys[0]?.id || '');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [selectedKeyId, setSelectedKeyId] = useState('');
 
   // Chat mode state
   const [systemPrompt, setSystemPrompt] = useState('');
@@ -141,19 +131,21 @@ export function Playground({
     }
   };
 
-  // Resolve key to use
-  const effectiveKey = useMemo(() => {
-    if (apiKeyInput.trim()) return apiKeyInput.trim();
-    if (activeSecret) return activeSecret;
-    if (serviceApiKey) return serviceApiKey;
-    return '';
-  }, [apiKeyInput, activeSecret, serviceApiKey]);
+  const rawModel = useMemo(() => {
+    try {
+      const model = JSON.parse(rawBody)?.model;
+      return typeof model === 'string' ? model.trim() : '';
+    } catch { return ''; }
+  }, [rawBody]);
+  const requestedModel = validModels.find(model => model.id === (mode === 'raw' && rawModel ? rawModel : currentModel));
+  const keys = keySource && requestedModel ? eligibleTestKeys(keySource, requestedModel.groups) : [];
+  const selectedKey = keys.find(key => key.id === selectedKeyId) || keys[0];
 
   // Execute request
   const executeRequest = async () => {
     if (!currentModel || busy) return;
-    if (!isAdmin && !effectiveKey) {
-      setErrorMsg(t('请先填入或选择 API Key', 'Please enter or select an API key'));
+    if (!isAdmin && (!keySource || !selectedKey)) {
+      setErrorMsg(t('请选择当前模型分组中可用的 API 密钥。', 'Select an available API key in the model group.'));
       return;
     }
 
@@ -198,6 +190,7 @@ export function Playground({
         }
       }
 
+      const effectiveKey = keySource && selectedKey ? await keySource.getSecret(selectedKey.id) : apiKeyInput.trim() || serviceApiKey;
       const headers: Record<string, string> = {
         'Content-Type': 'application/json'
       };
@@ -326,7 +319,7 @@ export function Playground({
         {/* Model Picker */}
         <div className="grid gap-1.5">
           <label className="text-xs font-medium text-muted-foreground">{t('选择测试模型', 'Select Model')}</label>
-          <SelectField value={currentModel} onValueChange={handleModelChange}>
+          <SelectField aria-label={t('选择测试模型', 'Select model')} value={currentModel} onValueChange={handleModelChange} disabled={busy}>
             {validModels.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.id} {m.group ? `(${m.group})` : ''}
@@ -335,24 +328,17 @@ export function Playground({
           </SelectField>
         </div>
 
-        {/* API Key selector or input */}
-        <div className="grid gap-1.5">
-          <label className="flex items-center justify-between text-xs font-medium text-muted-foreground">
-            <span>{t('鉴权凭据 (API Key)', 'API Key')}</span>
-            {activeSecret ? (
-              <span className="text-emerald-600 dark:text-emerald-400 font-normal">● {t('已绑定当前密钥', 'Key attached')}</span>
-            ) : isAdmin ? (
-              <span className="text-muted-foreground font-normal">{t('默认使用管理员会话', 'Admin session active')}</span>
-            ) : null}
+        {keySource ? <SavedTestKey source={keySource} keys={keys} selected={selectedKey?.id || ''}
+          onSelect={setSelectedKeyId} disabled={busy} t={t} /> : (
+          <label className="grid min-w-0 gap-1.5 text-xs font-medium text-muted-foreground">
+            <span className="flex flex-wrap justify-between gap-1">
+              {t('鉴权凭据 (API Key)', 'API key')}
+              <span className="font-normal">{t('默认使用管理员会话', 'Admin session active')}</span>
+            </span>
+            <Input type="password" placeholder={t('可选：使用特定 Key 测试', 'Optional: service key')}
+              value={apiKeyInput} onChange={e => setApiKeyInput(e.target.value)} autoComplete="off" />
           </label>
-          <Input
-            type="password"
-            placeholder={activeSecret ? t('已加载密钥', 'Secret loaded') : isAdmin ? t('可选：使用特定 Key 测试', 'Optional: Service Key') : 'gw_live_...'}
-            value={apiKeyInput}
-            onChange={(e) => setApiKeyInput(e.target.value)}
-            autoComplete="off"
-          />
-        </div>
+        )}
 
         {/* Send Button */}
         <div className="flex items-end">
@@ -362,7 +348,7 @@ export function Playground({
             size="lg"
             className="w-full gap-2 px-6 font-medium sm:w-auto"
             onClick={() => void executeRequest()}
-            disabled={busy || !currentModel}
+            disabled={busy || !currentModel || (!isAdmin && !selectedKey)}
           >
             <Send size={16} className={busy ? 'animate-pulse' : ''} />
             {busy ? t('请求中…', 'Sending…') : t('发送请求', 'Send request')}

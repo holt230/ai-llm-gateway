@@ -10,6 +10,13 @@ export function paymentError(status, message) {
 
 export const CHECKOUT_CHANNEL = 'wechat';
 const settingsTable = channel => channel === 'wechat' ? 'gateway_wechat_settings' : 'gateway_alipay_settings';
+const DAY_MS = 86_400_000;
+const BEIJING_OFFSET_MS = 8 * 3_600_000;
+
+function readChargeDetail(detail) {
+  try { return JSON.parse(detail) ?? {}; }
+  catch { return {}; }
+}
 
 // PostgreSQL uses row locks. Local SQLite serializes writers across connections using BEGIN IMMEDIATE.
 export async function openWalletStore(pool, file, space = 'default', userKeyCodec) {
@@ -168,9 +175,9 @@ export async function openWalletStore(pool, file, space = 'default', userKeyCode
           condition += ' AND o.paid IS NULL AND o.deleted IS NULL';
         }
         return q(
-          `SELECT o.id,o.fen,o.created,o.paid,o.deleted,o.owner,u.username
+          `SELECT o.id,o.fen,o.created,o.paid,o.deleted,o.owner,u.username${orderId ? ',o.receipt' : ''}
            FROM gateway_cny_order o
-           LEFT JOIN gateway_user u ON u.id = o.owner
+           LEFT JOIN gateway_user u ON u.space=o.space AND substr(o.owner,1,5)='user/' AND u.id=substr(o.owner,6)
            WHERE ${condition}
            ORDER BY o.created DESC LIMIT 100`,
           params
@@ -208,6 +215,37 @@ export async function openWalletStore(pool, file, space = 'default', userKeyCode
         if (balance || pending) throw paymentError(409, '此 Key 有余额或待核对订单，可暂停使用，请在完成对账后删除');
         await q('UPDATE gateway_cny_wallet SET closed=1 WHERE space=? AND owner=?', [space, owner]);
       });
+    },
+    async usageSummary(owner, days) {
+      const today = Math.floor((Date.now() + BEIJING_OFFSET_MS) / DAY_MS) * DAY_MS;
+      const firstDay = today - (days - 1) * DAY_MS;
+      const periodStart = firstDay - BEIJING_OFFSET_MS;
+      const rows = await transaction(q => q(
+        `SELECT created, detail, CAST(charged AS TEXT) AS charged FROM gateway_cny_charge
+         WHERE space=? AND owner=? AND created>=? AND created<? AND state IN ('settled','review')`,
+        [space, owner, new Date(periodStart).toISOString(), new Date(today + DAY_MS - BEIJING_OFFSET_MS).toISOString()]
+      ));
+      const series = Array.from({ length: days }, (_, i) => ({
+        date: new Date(firstDay + i * DAY_MS).toISOString().slice(0, 10),
+        inputTokens: 0, outputTokens: 0, charged: 0n
+      }));
+      const totals = { inputTokens: 0, outputTokens: 0, charged: 0n };
+      for (const row of rows) {
+        const day = series[Math.floor((Date.parse(row.created) - periodStart) / DAY_MS)];
+        if (!day) continue;
+        const usage = readChargeDetail(row.detail).usage;
+        const input = Number.isSafeInteger(usage?.inputTokens) && usage.inputTokens >= 0 ? usage.inputTokens : 0;
+        const output = Number.isSafeInteger(usage?.outputTokens) && usage.outputTokens >= 0 ? usage.outputTokens : 0;
+        const charged = row.charged === null ? 0n : BigInt(row.charged);
+        day.inputTokens += input;
+        day.outputTokens += output;
+        day.charged += charged;
+        totals.inputTokens += input;
+        totals.outputTokens += output;
+        totals.charged += charged;
+      }
+      const serialize = ({ charged, ...usage }) => ({ ...usage, chargedCny: yuanString(charged) });
+      return { series: series.map(serialize), totals: serialize(totals) };
     },
     async summary(owner, includeCancelled = false) {
       return transaction(async (q) => {
@@ -324,7 +362,7 @@ export async function openWalletStore(pool, file, space = 'default', userKeyCode
     async settle(id, actual, detail, manual = false) {
       return transaction(async (q) => {
         const [charge] = await q(
-          'SELECT owner,state,review_after,CAST(held AS TEXT) AS held,CAST(charged AS TEXT) AS charged FROM gateway_cny_charge WHERE id=? AND space=?' +
+          'SELECT owner,state,review_after,detail,CAST(held AS TEXT) AS held,CAST(charged AS TEXT) AS charged FROM gateway_cny_charge WHERE id=? AND space=?' +
             lock,
           [id, space]
         );
@@ -346,7 +384,7 @@ export async function openWalletStore(pool, file, space = 'default', userKeyCode
         await q("UPDATE gateway_cny_charge SET state='settled',actual=?,charged=?,detail=? WHERE id=?", [
           actual.toString(),
           debit.toString(),
-          JSON.stringify(detail),
+          JSON.stringify(manual ? { ...readChargeDetail(charge.detail), ...detail } : detail),
           id
         ]);
         return yuanString(debit);

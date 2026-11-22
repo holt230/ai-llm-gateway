@@ -1,22 +1,22 @@
 import { FormDialog, dialogForm, dialogBody, dialogFooter } from './components/ui/form-dialog';
 import { SelectField } from './components/ui/select-field';
-import { Input } from './components/ui/input';
+import { SavedTestKey, eligibleTestKeys, type TestKeySource } from './SavedTestKey';
 import { Button } from './components/ui/button';
 import { FormEvent, useEffect, useRef, useState } from 'react';
-import { Play, Send } from 'lucide-react';
+import { Send } from 'lucide-react';
 import type { CustomerDashboard } from './customer-session';
 
 type Model = CustomerDashboard['models'][number];
 export function TestModelCall({
   base,
   models,
-  issued,
+  keySource,
   english,
   onCharged
 }: {
   base: string;
   models: Model[];
-  issued?: string;
+  keySource: TestKeySource;
   english: boolean;
   onCharged: () => void;
 }) {
@@ -24,21 +24,24 @@ export function TestModelCall({
   const choices = models.filter((m) => m.endpoints.some((e) => ['*', 'chat', 'responses', 'embeddings'].includes(e)));
   const [open, setOpen] = useState(false);
   const [choice, setChoice] = useState('');
-  const [inputKey, setInputKey] = useState('');
+  const [keyId, setKeyId] = useState('');
   const [output, setOutput] = useState('');
   const [busy, setBusy] = useState(false);
   const controller = useRef<AbortController | null>(null);
   useEffect(() => () => controller.current?.abort(), []);
-  const model = choices.find((m) => m.id === choice) || choices[0];
+  const model = choices.find(m => m.id === choice) || choices.find(m => eligibleTestKeys(keySource, m.groups).length) || choices[0];
+  const keys = eligibleTestKeys(keySource, model?.groups);
+  const selectedKey = keys.find(key => key.id === keyId) || keys[0];
+  const close = () => { setOpen(false); setOutput(''); };
   const send = async (e: FormEvent) => {
     e.preventDefault();
-    const key = (issued || inputKey).trim();
-    if (!model || !key || busy) return;
+    if (!model || !selectedKey || busy) return;
     const abort = new AbortController();
     controller.current = abort;
     setBusy(true);
     setOutput('');
     try {
+      const key = await keySource.getSecret(selectedKey.id);
       const chat = model.endpoints.some((v) => v === '*' || v === 'chat');
       const endpoint = chat ? 'chat/completions' : model.endpoints.includes('responses') ? 'responses' : 'embeddings';
       const prompt = 'Hello';
@@ -75,39 +78,23 @@ export function TestModelCall({
       <Button variant="outline" type="button" onClick={() => setOpen(true)}>{t('在网页测试调用', 'Test a request here')}</Button>
       {open && <FormDialog title={t('在网页测试调用', 'Test a request here')} closeLabel={t('关闭', 'Close')} busy={busy}
         description={t('发送一条 Hello 到当前网关。成功调用按所选模型的用量计费。', 'Send a Hello message. Successful requests are charged at the model rate.')}
-        onClose={() => { setOpen(false); setInputKey(''); setOutput(''); }}>
+        onClose={close}>
         <form className={dialogForm} onSubmit={send}>
           <div data-slot="dialog-body" className={dialogBody}>
-        <label>
-          {t('测试模型', 'Model')}
-          <SelectField value={model.id} onValueChange={(value) => setChoice(value)}>
-            {choices.map((m) => (
-              <option key={m.id} value={m.id}>{m.id}</option>
-            ))}
-          </SelectField>
-        </label>
-        {issued ? (
-          <p>{t('使用刚创建的密钥', 'Using your newly created key')}</p>
-        ) : (
-          <label>
-            API Key
-            <Input
-              type="password"
-              autoComplete="off"
-              required
-              value={inputKey}
-              placeholder="gw_live_…"
-              onChange={(e) => setInputKey(e.target.value)}
-            />
-          </label>
-        )}
+            <label className="grid gap-1.5 text-xs font-medium text-muted-foreground">
+              {t('测试模型', 'Model')}
+              <SelectField aria-label={t('测试模型', 'Model')} value={model.id} disabled={busy} onValueChange={setChoice}>
+                {choices.map(m => <option key={m.id} value={m.id}>{m.id}</option>)}
+              </SelectField>
+            </label>
+            <SavedTestKey source={keySource} keys={keys} selected={selectedKey?.id || ''} onSelect={setKeyId} disabled={busy} t={t} />
             {output && <pre role="status" className="max-w-full overflow-auto rounded-md bg-muted p-3 text-sm whitespace-pre-wrap wrap-anywhere">{output}</pre>}
           </div>
           <div data-slot="dialog-footer" className={dialogFooter}>
-            <Button type="button" variant="outline" disabled={busy} onClick={() => setOpen(false)}>
+            <Button type="button" variant="outline" disabled={busy} onClick={close}>
               {t('关闭', 'Close')}
             </Button>
-            <Button variant="default" type="submit" disabled={busy || !(issued || inputKey.trim())}>
+            <Button variant="default" type="submit" disabled={busy || !selectedKey}>
               <Send size={15} />
               {busy ? t('调用中…', 'Sending…') : t('发送测试请求', 'Send test request')}
             </Button>

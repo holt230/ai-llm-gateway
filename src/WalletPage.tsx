@@ -8,6 +8,7 @@ import { AlertCircle, ArrowRight, Check, CheckCircle2, Clock, Copy, CreditCard, 
 import { useConfirmation } from './components/ui/confirmation';
 import { writeClipboard } from './clipboard';
 import { AccountPricing } from './WalletPricing';
+import { WalletUsage } from './WalletUsage';
 import { accountRequest } from './account-api';
 import { cn } from './components/ui/utils';
 
@@ -299,6 +300,7 @@ export function WalletAccount({
           )}
         </div>
       </section>
+      {!secret && <WalletUsage base={base} t={t} active={active} revision={revision} />}
       {guidance && (
         <Card as="section" className="panel workspace-guidance">
           <div>

@@ -53,10 +53,26 @@ legacyDb.prepare('INSERT INTO gateway_support_message(thread,seq,sender,text,cre
 legacyDb.close();
 let upstreamCalls = 0;
 let lastUpstreamBody;
+let lastImageCall;
 const upstream = createServer(async (req, res) => {
-  let raw = '';
-  for await (const chunk of req) raw += chunk;
-  const body = JSON.parse(raw);
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks);
+  if (req.url === '/v1/images/generations' || req.url === '/v1/images/edits') {
+    const editing = req.url.endsWith('/edits');
+    const fixture = await readFile(qrFile);
+    if (editing) {
+      const form = await new Request('http://127.0.0.1/images/edits', {
+        method: 'POST', headers: { 'content-type': req.headers['content-type'] }, body: raw
+      }).formData();
+      const image = form.get('image');
+      lastImageCall = { model: form.get('model'), prompt: form.get('prompt'), size: form.get('size'), n: Number(form.get('n')), image: Buffer.from(await image.arrayBuffer()) };
+    } else lastImageCall = JSON.parse(raw.toString('utf8'));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ b64_json: fixture.toString('base64') }] }));
+    return;
+  }
+  const body = JSON.parse(raw.toString('utf8'));
   upstreamCalls += 1;
   lastUpstreamBody = body;
   if (body.input === 'error') {
@@ -84,7 +100,7 @@ const config = {
     internalApiKeys: [
       { id: 'admin', role: 'admin', key: admin, perMinute: 0 },
       { id: 'alice', role: 'service', key: alice, prepaid: true, perMinute: 0 },
-      { id: 'legacy', role: 'service', key: 'legacy-test-key', walletId: 'legacy-owner', prepaid: true, perMinute: 0 },
+      { id: 'legacy', name: 'Legacy billing key', role: 'service', key: 'legacy-test-key', walletId: 'legacy-owner', prepaid: true, perMinute: 0 },
       { id: 'bob', role: 'service', key: bob, prepaid: true, perMinute: 0 }
     ]
   },
@@ -204,6 +220,9 @@ try {
   assert.equal(alipayShortcut.status, 200);
   assert.match(await alipayShortcut.text(), /入账成功/);
   assert.equal((await ok(confirmAlipay('AAAAAAAA0003', alipayReceipt))).repeated, true);
+  const historicalAlipayOrder = (await ok(api('/admin/payments/alipay/orders?id=AAAAAAAA0003', admin))).orders[0];
+  assert.equal(historicalAlipayOrder.serviceKeyName, 'Legacy billing key');
+  assert.equal(historicalAlipayOrder.transactionId, alipayReceipt);
   assert.equal((await confirm('AAAAAAAA0002', '2345678901234567', '5.91')).status, 409);
   assert.equal((await ok(confirm('AAAAAAAA0002', '2345678901234567'))).channel, 'wechat');
   const wechatShortcut = await shortcutConfirm('wechat', token, current.id, '1.23', '9345678901234567');
@@ -308,13 +327,34 @@ try {
   assert.equal((await ok(userApi('keys/' + firstKey.id + '/secret', cookie))).secret, firstKey.secret);
   assert.equal((await userApi('keys/' + firstKey.id + '/secret', otherCookie)).status, 404);
   assert.equal((await userApi('keys/' + firstKey.id + '/rotate', otherCookie, {})).status, 404);
+  const customerLookup = '/admin/payments/wechat/orders?id=' + customerOrder.id;
+  const pendingCustomerOrder = (await ok(api(customerLookup, admin))).orders[0];
+  assert.equal(pendingCustomerOrder.username, credentials.username);
+  assert.equal(pendingCustomerOrder.transactionId, null);
   await ok(confirm(customerOrder.id, '92345678901234'));
+  const paidCustomerOrder = (await ok(api(customerLookup, admin))).orders[0];
+  assert.equal(paidCustomerOrder.username, credentials.username);
+  assert.equal(paidCustomerOrder.transactionId, '92345678901234');
+  assert.equal(paidCustomerOrder.fen, 590);
+  const paidCustomerRow = (await ok(api('/admin/payments/wechat/orders?filter=paid', admin))).orders.find(row => row.id === customerOrder.id);
+  assert.equal(paidCustomerRow.username, credentials.username);
+  assert.equal('transactionId' in paidCustomerRow, false);
+  const otherCustomerLookup = await fetch(base + customerLookup, { headers: { cookie: otherCookie } });
+  assert.equal(otherCustomerLookup.ok, false);
+  assert.equal((await ok(api('/admin/payments/alipay/orders?id=' + customerOrder.id, admin))).orders.length, 0);
   assert.equal((await account(firstKey.secret)).balance, '5.90');
   assert.equal((await account(secondKey.secret)).balance, '5.90');
   assert.equal((await account(otherKey.secret)).balance, '0.00');
   assert.equal((await ok(userApi('wallet', otherCookie))).orders.length, 0);
   await ok(api('/v1/responses', firstKey.secret, { model: 'demo', input: 'hi' }));
   await wait(async () => (await account(secondKey.secret)).balance === '5.89925');
+  const usagePath = 'wallet/usage?days=7';
+  const recentUsage = await ok(userApi(usagePath, cookie));
+  assert.deepEqual(recentUsage.totals, { inputTokens: 1000, outputTokens: 100, chargedCny: '0.00075' });
+  assert.equal(recentUsage.series.length, 7);
+  assert.equal((await userApi(usagePath)).status, 401);
+  assert.equal((await userApi('wallet/usage?days=8', cookie)).status, 400);
+  assert.deepEqual((await ok(userApi(usagePath, otherCookie))).totals, { inputTokens: 0, outputTokens: 0, chargedCny: '0.00' });
   const setStatus = (enabled) =>
     fetch(base + '/admin/users/' + user.id, {
       method: 'PUT',
@@ -741,7 +781,62 @@ try {
   assert.equal(lastUpstreamBody.max_completion_tokens, 4096);
   console.log('Prepaid budget tests passed: insufficient balance stops before upstream; explicit and default output limits forwarded');
 
+  const statsReg = await userApi('register', null, { username: 'wallet_stats_fixture', password: 'wallet-stats-test-password' });
+  const statsCookie = statsReg.headers.getSetCookie()[0].split(';')[0];
+  const statsAccount = await ok(statsReg);
+  const statsOrder = await ok(userApi('orders', statsCookie, { channel: 'wechat' }));
+  await ok(channelApi('confirm', 'POST', admin, { orderId: statsOrder.id, amount: '5.90', transactionId: '20261120123456789002' }));
+  const dayMs = 86_400_000;
+  const offset = 8 * 3_600_000;
+  const today = Math.floor((Date.now() + offset) / dayMs) * dayMs;
+  const dayStart = today - offset;
+  const iso = ms => new Date(ms).toISOString();
+  const seed = new DatabaseSync(join(temp, 'wallet.db'));
+  const insert = seed.prepare(`INSERT INTO gateway_cny_charge(id,space,owner,model,version,created,review_after,held,state,charged,detail)
+    VALUES(?,'default',?,'demo','test',?,?,'1000',?,?,?)`);
+  const row = (id, ms, state, charged, inputTokens, outputTokens) => insert.run(id, 'user/' + statsAccount.user.id,
+    iso(ms), iso(ms), state, charged, JSON.stringify({ usage: { inputTokens, outputTokens } }));
+  for (let i = 0; i < 21; i++) row('stats-' + i, dayStart - dayMs, 'settled', 2, 100, 10);
+  row('stats-older', dayStart - 7 * dayMs, 'settled', 100, 40, 4);
+  row('stats-before-window', dayStart - 30 * dayMs, 'settled', 400, 50, 5);
+  const reviewId = '076d44df-feff-4991-a467-e01681fffb03';
+  row(reviewId, dayStart, 'review', null, 50, 5);
+  seed.close();
+  assert.equal((await ok(userApi('wallet', statsCookie))).charges.length, 20);
+  const short = await ok(userApi(usagePath, statsCookie));
+  assert.deepEqual(short.totals, { inputTokens: 2150, outputTokens: 215, chargedCny: '0.0000000042' });
+  assert.deepEqual(short.series.at(-1), { date: iso(today).slice(0, 10), inputTokens: 50, outputTokens: 5, chargedCny: '0.00' });
+  const longer = await ok(userApi('wallet/usage?days=30', statsCookie));
+  assert.equal(longer.series.length, 30);
+  assert.deepEqual(longer.totals, { inputTokens: 2190, outputTokens: 219, chargedCny: '0.0000000142' });
+  await ok(api('/admin/payments/reviews', admin, { id: reviewId, amount: '0.00000001', reason: 'Fixture settlement' }));
+  assert.deepEqual((await ok(userApi(usagePath, statsCookie))).totals, { inputTokens: 2150, outputTokens: 215, chargedCny: '0.0000000142' });
+  console.log('Wallet usage passed: account isolation, Beijing days, full history, and exact settled CNY');
 
+  await configure('models/studio-image', { provider: 'tests', upstreamModel: 'gpt-image-2', endpoints: ['images'], saasEnabled: true });
+  const catalog = await ok(fetch(base + '/payments/info?usable=true'));
+  assert.ok(catalog.models.some(model => model.id === 'studio-image' && model.endpoints.includes('images')));
+  assert.equal(catalog.prices['studio-image'].image, 0.125);
+  const imageKey = await ok(userApi('keys', statsCookie, { name: 'Image fixture' }));
+  const balanceBeforeImage = parseYuan((await account(imageKey.secret)).balance, 10);
+  const imageRequest = { model: 'studio-image', prompt: 'coast at dusk', size: '1536x1024', n: 1 };
+  const firstImage = await ok(api('/v1/images/generations', imageKey.secret, imageRequest));
+  assert.deepEqual(lastImageCall, { ...imageRequest, model: 'gpt-image-2' });
+  await wait(async () => parseYuan((await account(imageKey.secret)).balance, 10) === balanceBeforeImage - parseYuan('0.125', 10));
+  const sourceImage = Buffer.from(firstImage.data[0].b64_json, 'base64');
+  const editOptions = { ...imageRequest, prompt: 'keep the subject and soften the light' };
+  const form = new FormData();
+  for (const [name, value] of Object.entries(editOptions)) form.append(name, String(value));
+  form.append('image', new Blob([sourceImage], { type: 'image/png' }), 'reference.png');
+  const editedImage = await ok(fetch(base + '/v1/images/edits', {
+    method: 'POST', headers: { authorization: 'Bearer ' + imageKey.secret }, body: form
+  }));
+  assert.ok(editedImage.data[0].b64_json);
+  assert.deepEqual(lastImageCall, { ...editOptions, model: 'gpt-image-2', image: sourceImage });
+  await wait(async () => parseYuan((await account(imageKey.secret)).balance, 10) === balanceBeforeImage - parseYuan('0.25', 10));
+  const imageCharges = (await ok(userApi('wallet', statsCookie))).charges.filter(row => row.model === 'gpt-image-2');
+  assert.deepEqual(imageCharges.map(row => row.amount), ['0.125', '0.125']);
+  console.log('Image studio passed: customer generation, multipart editing, and one wallet charge per request');
 } finally {
   await stop();
   await new Promise((resolve) => upstream.close(resolve));

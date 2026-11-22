@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { MessageCircle, Send } from 'lucide-react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { MessageCircle, Minus, Send } from 'lucide-react';
 import { accountRequest } from './account-api';
 import { Button } from './components/ui/button';
 import { Card } from './components/ui/card';
@@ -32,19 +32,46 @@ function SupportStatus({ status, t }: { status: Status; t: Label }) {
 }
 
 
-function Messages({ thread, t }: { thread: Thread; t: Label }) {
-  const bottom = useRef<HTMLDivElement>(null);
-  const last = thread.messages[thread.messages.length - 1]?.seq;
-  useEffect(() => { bottom.current?.scrollIntoView({ block: 'nearest' }); }, [thread.id, last]);
-  return <div className="space-y-3" role="log" aria-label={t('对话消息', 'Conversation messages')}>
-    {thread.messages.map(message => <div key={message.seq} className={message.sender === 'admin' ? 'me-auto max-w-[85%]' : 'ms-auto max-w-[85%]'}>
-      <div className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
-        <span className="font-medium">{message.sender === 'admin' ? t('客服', 'Support') : t('用户', 'Customer')}</span>
-        <time dateTime={message.created}>{new Date(message.created).toLocaleString()}</time>
-      </div>
-      <p className={'m-0 rounded-xl px-3 py-2 text-sm leading-relaxed whitespace-pre-wrap wrap-anywhere ' + (message.sender === 'admin' ? 'bg-accent' : 'bg-muted')}>{message.text}</p>
-    </div>)}
-    <div ref={bottom} />
+function Messages({ thread, viewer, t }: { thread: Thread; viewer: Message['sender']; t: Label }) {
+  const log = useRef<HTMLDivElement>(null);
+  const atEnd = useRef(true);
+  const previousThread = useRef<string | undefined>(undefined);
+  const last = thread.messages[thread.messages.length - 1];
+  const locale = t('zh-CN', 'en');
+  useEffect(() => {
+    if (log.current && (previousThread.current !== thread.id || atEnd.current || last?.sender === viewer)) {
+      log.current.scrollTop = log.current.scrollHeight;
+      atEnd.current = true;
+    }
+    previousThread.current = thread.id;
+  }, [thread.id, last?.seq, last?.sender, viewer]);
+
+  return <div ref={log} role="log" aria-label={t('对话消息', 'Conversation messages')} tabIndex={0}
+    className="min-h-0 space-y-3 overflow-y-auto overscroll-contain p-4 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+    onScroll={event => {
+      const { scrollHeight, scrollTop, clientHeight } = event.currentTarget;
+      atEnd.current = scrollHeight - scrollTop - clientHeight < 48;
+    }}>
+    {thread.messages.map((message, index) => {
+      const mine = message.sender === viewer;
+      const time = new Date(message.created);
+      const prior = thread.messages[index - 1];
+      const newDay = !prior || new Date(prior.created).toDateString() !== time.toDateString();
+      return <div key={message.seq} className="grid gap-2">
+        {newDay && <div className="py-0.5 text-center text-xs text-muted-foreground">
+          {time.toLocaleDateString(locale, { year: 'numeric', month: 'short', day: 'numeric' })}
+        </div>}
+        <div className={mine ? 'ms-auto max-w-[86%]' : 'me-auto max-w-[86%]'}>
+          <div className={'mb-1 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground ' + (mine ? 'justify-end' : '')}>
+            <span className="font-medium wrap-anywhere">{mine ? t('我', 'You') : viewer === 'user'
+              ? t('客服', 'Support') : thread.username || (thread.scope === 'guest' ? t('访客', 'Guest') : t('用户', 'Customer'))}</span>
+            <time dateTime={message.created}>{time.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}</time>
+          </div>
+          <p className={'m-0 rounded-xl px-3 py-2 text-sm leading-relaxed whitespace-pre-wrap wrap-anywhere ' + (mine
+            ? 'rounded-br-sm bg-primary text-primary-foreground' : 'rounded-bl-sm border border-border bg-background text-foreground')}>{message.text}</p>
+        </div>
+      </div>;
+    })}
   </div>;
 }
 
@@ -63,7 +90,13 @@ export function SupportBubble({ base, english, signedIn }: { base: string; engli
   const [confirm, setConfirm] = useState('');
   const [code, setCode] = useState('');
   const button = useRef<HTMLButtonElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const panelId = useId();
+  const expanded = open && !code;
 
+  useEffect(() => {
+    if (expanded) heading.current?.focus({ preventScroll: true });
+  }, [expanded]);
   useEffect(() => {
     const show = () => setOpen(true);
     window.addEventListener('wormhole-support-open', show);
@@ -104,9 +137,15 @@ export function SupportBubble({ base, english, signedIn }: { base: string; engli
     setConfirm('');
     setError('');
   }
+  function closeChat() {
+    if (busy) return;
+    setOpen(false);
+    exitReset();
+    button.current?.focus({ preventScroll: true });
+  }
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (busy || (!resetting && (thread === undefined || !message.trim()))) return;
     setError('');
     if (resetting && password !== confirm) {
       setError(t('两次输入的密码不一致。', 'The passwords do not match.'));
@@ -143,63 +182,85 @@ export function SupportBubble({ base, english, signedIn }: { base: string; engli
     finally { setBusy(false); }
   }
 
-  return <>
-    <div className="fixed right-4 bottom-4 z-30 flex max-w-[calc(100%-2rem)] flex-wrap items-center justify-end gap-2 sm:right-6 sm:bottom-6">
-      {code && <RecoveryCodeNotice code={code} english={english} onSaved={() => { setCode(''); window.dispatchEvent(new Event('gateway-session-check')); }} />}
-      <Button ref={button} className="rounded-full shadow-md" type="button" size="lg" aria-haspopup="dialog" onClick={openSupport}>
-        <MessageCircle aria-hidden="true" />{t('联系客服', 'Contact support')}
-        {attention && <span role="status" className="rounded-full bg-primary-foreground px-2 py-0.5 text-xs text-primary">{t('新消息', 'New')}</span>}
-      </Button>
-    </div>
-    {open && !code && <FormDialog title={resetting ? t('设置新密码', 'Set a new password') : t('站内客服', 'Customer support')}
-      closeLabel={t('关闭', 'Close')} busy={busy} returnFocus={() => button.current}
-      description={resetting ? thread?.reset?.username : signedIn
-        ? t('此对话归属于当前账号。请勿发送密码、恢复码或 API 密钥。', 'This conversation belongs to this account. Never send passwords, recovery codes, or API keys.')
-        : t('访客回复只能在此浏览器未登录时查看。请勿发送密码、恢复码或 API 密钥。', 'To view guest replies, return to this browser while signed out. Never send passwords, recovery codes, or API keys.')}
-      onClose={() => { setOpen(false); exitReset(); }}>
+  return <div className="fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] z-30 flex max-w-[calc(100%-2rem)] flex-col-reverse items-end gap-3 sm:right-6 sm:bottom-6">
+    <Button ref={button} className="rounded-full shadow-md" type="button" size="lg" aria-expanded={expanded}
+      aria-controls={expanded ? panelId : undefined} disabled={busy && expanded} onClick={expanded ? closeChat : openSupport}>
+      {expanded ? <Minus aria-hidden="true" /> : <MessageCircle aria-hidden="true" />}
+      {expanded ? t('收起客服', 'Minimize support') : t('联系客服', 'Contact support')}
+      {!expanded && attention && <span role="status" className="rounded-full bg-primary-foreground px-2 py-0.5 text-xs text-primary">{t('新消息', 'New')}</span>}
+    </Button>
+    {code && <RecoveryCodeNotice code={code} english={english} onSaved={() => { setCode(''); window.dispatchEvent(new Event('gateway-session-check')); }} />}
+    {expanded && <Card as="section" id={panelId} aria-labelledby={panelId + '-title'} aria-busy={busy}
+      className="grid h-[min(35rem,calc(100dvh-5rem))] w-[26rem] max-w-full grid-rows-[auto_minmax(0,1fr)] overflow-hidden shadow-xl"
+      onKeyDown={event => {
+        if (event.key === 'Escape' && !event.defaultPrevented && !busy) {
+          event.stopPropagation();
+          closeChat();
+        }
+      }}>
+      <header className="flex items-start gap-3 border-b border-border px-4 py-3">
+        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-accent text-accent-foreground"><MessageCircle size={18} aria-hidden="true" /></span>
+        <div className="min-w-0 flex-1">
+          <h2 id={panelId + '-title'} ref={heading} tabIndex={-1} className="m-0 text-base font-semibold outline-none">
+            {resetting ? t('设置新密码', 'Set a new password') : t('站内客服', 'Customer support')}
+          </h2>
+          <p className="mt-0.5 mb-0 text-xs leading-relaxed text-muted-foreground wrap-anywhere">
+            {resetting ? thread?.reset?.username : signedIn
+              ? t('登录此账号可继续对话', 'Sign in to this account to continue the conversation')
+              : t('访客对话 · 仅在此浏览器未登录时可见', 'Guest conversation · visible here while signed out')}
+          </p>
+        </div>
+        {!resetting && thread && <SupportStatus status={thread.status} t={t} />}
+      </header>
       <form className={dialogForm} onSubmit={submit}>
-        <div className={dialogBody}>
-          {(error || loadError) && <p className="text-sm text-destructive" role="alert">{error || loadError}</p>}
-          {resetting ? <>
-            <label className="grid gap-1.5 text-sm">{t('新密码（至少 12 位）', 'New password (at least 12 characters)')}
-              <Input type="password" name="new-password" autoComplete="new-password" minLength={12} maxLength={256} required value={password} onChange={e => setPassword(e.target.value)} />
-            </label>
-            <label className="grid gap-1.5 text-sm">{t('确认新密码', 'Confirm new password')}
-              <Input type="password" autoComplete="new-password" minLength={12} maxLength={256} required value={confirm} onChange={e => setConfirm(e.target.value)} />
-            </label>
-            <p className="text-sm text-muted-foreground">{t('重置会撤销原有登录会话、API 密钥和恢复码。余额与调用记录不变。', 'Resetting revokes your existing sessions, API keys, and recovery code. Your balance and request history stay intact.')}</p>
-          </> : <>
-            {thread ? <>
-              <div className="flex flex-wrap items-center justify-between gap-2"><SupportStatus status={thread.status} t={t} />
-                {thread.status === 'resolved' && <span className="text-xs text-muted-foreground">{t('如需跟进，可直接发新消息。', 'Send a message to reopen the conversation.')}</span>}
-              </div>
-              <Messages thread={thread} t={t} />
-            </> : <p className="text-sm text-muted-foreground">
-              {thread === undefined ? t('正在查看会话…', 'Checking for an existing conversation…') : t('请描述你的问题。找回账号时，请提供用户名，等待客服核实。', 'Tell us what happened. For account recovery, include your username and wait for support to verify ownership.')}
+        {resetting ? <div className={dialogBody}>
+          {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+          <label className="grid gap-1.5 text-sm">{t('新密码（至少 12 位）', 'New password (at least 12 characters)')}
+            <Input type="password" name="new-password" autoComplete="new-password" minLength={12} maxLength={256} required value={password} onChange={e => setPassword(e.target.value)} />
+          </label>
+          <label className="grid gap-1.5 text-sm">{t('确认新密码', 'Confirm new password')}
+            <Input type="password" autoComplete="new-password" minLength={12} maxLength={256} required value={confirm} onChange={e => setConfirm(e.target.value)} />
+          </label>
+          <p className="text-sm text-muted-foreground">{t('重置会撤销原有登录会话、API 密钥和恢复码。余额与调用记录不变。', 'Resetting revokes your existing sessions, API keys, and recovery code. Your balance and request history stay intact.')}</p>
+        </div> : <div className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] bg-muted/50">
+          {thread ? <Messages thread={thread} viewer="user" t={t} /> : <div className="grid min-h-0 place-content-center overflow-y-auto p-4 text-center">
+            <p className="m-0 text-sm font-medium">{thread === undefined ? t('正在加载会话…', 'Loading conversation…') : t('你好，需要什么帮助？', 'Hi, how can we help?')}</p>
+            {thread === null && <p className="mt-1 mb-0 max-w-[36ch] text-xs leading-relaxed text-muted-foreground">
+              {t('请描述遇到的问题。找回账号时，请提供用户名供客服核实。', 'Tell us what happened. For account recovery, provide the username for support to verify.')}
             </p>}
-            {thread?.reset && <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-accent p-3 text-sm">
-              <div>
+          </div>}
+          <div className="space-y-2 px-4 empty:hidden">
+            {(error || loadError) && <p className="m-0 pb-2 text-sm text-destructive wrap-anywhere" role="alert">{error || loadError}</p>}
+            {thread?.reset && <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-accent p-3 text-sm">
+              <div className="min-w-0 wrap-anywhere">
                 <p className="m-0 font-medium">{t('客服已授权重置密码', 'Support authorized a password reset')}</p>
                 <small className="text-muted-foreground">{thread.reset.username} · {t('有效至', 'Expires at')} {new Date(thread.reset.expires).toLocaleTimeString()}</small>
               </div>
-              <Button variant="outline" size="sm" type="button" onClick={() => { setError(''); setResetting(true); }}>{t('设置新密码', 'Set a new password')}</Button>
+              <Button variant="outline" size="sm" type="button" disabled={busy} onClick={() => { setError(''); setResetting(true); }}>{t('设置新密码', 'Set a new password')}</Button>
             </div>}
-          </>}
-        </div>
+            {thread?.status === 'resolved' && <p className="m-0 pb-2 text-xs text-muted-foreground">{t('如需跟进，可直接发新消息。', 'Send a message to reopen the conversation.')}</p>}
+          </div>
+        </div>}
         {resetting ? <div className={dialogFooter}>
           <Button variant="outline" type="button" disabled={busy} onClick={exitReset}>{t('返回对话', 'Back to conversation')}</Button>
           <Button type="submit" disabled={busy}>{t('重置密码', 'Reset password')}</Button>
-        </div> : <div className={dialogFooter}>
-          <Textarea className="min-h-16 resize-none" value={message} maxLength={2000} onChange={e => setMessage(e.target.value)}
-            aria-label={t('消息', 'Message')} placeholder={t('输入消息…', 'Write a message…')} />
-          {!signedIn && thread && <Button variant="ghost" size="sm" type="button" className="me-auto" disabled={busy} onClick={() => void endGuest()}>
-            {t('结束访客会话', 'End guest conversation')}
-          </Button>}
-          <Button type="submit" disabled={busy || thread === undefined || !message.trim()}><Send aria-hidden="true" />{t('发送消息', 'Send message')}</Button>
+        </div> : <div className="grid min-w-0 gap-1 border-t border-border px-4 py-3">
+          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-2">
+            <Textarea className="min-h-10 max-h-24 resize-none overflow-y-auto" rows={1} value={message} maxLength={2000} onChange={e => setMessage(e.target.value)}
+              aria-label={t('消息', 'Message')} placeholder={t('输入消息…', 'Write a message…')} />
+            <Button type="submit" size="icon-lg" aria-label={t('发送消息', 'Send message')} title={t('发送消息', 'Send message')}
+              disabled={busy || thread === undefined || !message.trim()}><Send aria-hidden="true" /></Button>
+          </div>
+          <div className="flex min-h-6 flex-wrap items-center justify-between gap-x-2">
+            <p className="m-0 text-xs text-muted-foreground">{t('请勿发送密码、恢复码或 API 密钥。', 'Never share passwords, recovery codes, or API keys.')}</p>
+            {!signedIn && thread && <Button variant="ghost" size="xs" type="button" className="ms-auto text-muted-foreground" disabled={busy} onClick={() => void endGuest()}>
+              {t('结束访客会话', 'End guest conversation')}
+            </Button>}
+          </div>
         </div>}
       </form>
-    </FormDialog>}
-  </>;
+    </Card>}
+  </div>;
 }
 
 export function SupportAdmin({ request, english }: { request: AdminRequest; english: boolean }) {
@@ -256,7 +317,7 @@ export function SupportAdmin({ request, english }: { request: AdminRequest; engl
   }
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!thread || busy) return;
+    if (!thread || busy || thread.status === 'expired' || (!grant && !message.trim())) return;
     setError('');
     if (grant && !await ask(t(`确认已核实账号「${username.trim()}」的归属？此会话将获得一次性密码重置权限。`, `Confirm you verified ownership of “${username.trim()}”. This conversation will receive one-time reset access.`))) return;
     setBusy(true);
@@ -310,15 +371,23 @@ export function SupportAdmin({ request, english }: { request: AdminRequest; engl
         </Button></TableCell>
       </TableRow>)}</TableBody>
     </Table> : !listError && <p className="text-sm text-muted-foreground" role="status">{tickets ? t('当前筛选下没有会话。', 'No conversations match this filter.') : t('正在加载会话…', 'Loading conversations…')}</p>}
-    {thread && <FormDialog title={t('客服会话', 'Support conversation')} description={`${thread.username || t('访客', 'Guest')} · ${thread.id.slice(0, 8)}`}  drawer busy={busy} closeLabel={t('关闭', 'Close')}
+    {thread && <FormDialog title={t('客服会话', 'Support conversation')}
+      description={`${thread.username || t('访客', 'Guest')} · ${thread.id.slice(0, 8)}`} drawer busy={busy} closeLabel={t('关闭', 'Close')}
       onClose={() => { setThread(undefined); setError(''); }}>
-      <form className={dialogForm} onSubmit={submit}>
-        <div className={dialogBody}>
-          <div><SupportStatus status={thread.status} t={t} /></div>
-          <Messages thread={thread} t={t} />
-          {thread.reset && <p className="rounded-lg bg-accent p-3 text-sm" role="status">{t('已授权重置', 'Reset authorized')} · {thread.reset.username} · {t('有效至', 'Expires at')} {new Date(thread.reset.expires).toLocaleTimeString()}</p>}
-          {expired && <p className="text-sm text-muted-foreground">{t('此会话已过期。', 'This conversation has expired.')}</p>}
-          {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+      <form className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto]" onSubmit={submit}>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2 sm:px-6">
+          <SupportStatus status={thread.status} t={t} />
+          {!expired && <div className="flex flex-wrap items-center gap-1.5">
+            {thread.status !== 'resolved' && <Button variant="ghost" size="sm" type="button" disabled={busy || grant} onClick={() => void resolveThread()}>{t('标为已解决', 'Mark as resolved')}</Button>}
+            <Button variant="outline" size="sm" type="button" disabled={busy || grant} onClick={() => { setUsername(thread.username ?? ''); setGrant(true); setError(''); }}>{t('协助重置密码', 'Help reset password')}</Button>
+          </div>}
+        </div>
+        <div className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] bg-muted/50">
+          <Messages thread={thread} viewer="admin" t={t} />
+          <div className="space-y-2 px-4 pb-3 empty:hidden sm:px-6">
+            {thread.reset && <p className="m-0 rounded-lg bg-accent p-3 text-sm wrap-anywhere" role="status">{t('已授权重置', 'Reset authorized')} · {thread.reset.username} · {t('有效至', 'Expires at')} {new Date(thread.reset.expires).toLocaleTimeString()}</p>}
+            {error && <p className="m-0 text-sm text-destructive wrap-anywhere" role="alert">{error}</p>}
+          </div>
         </div>
         {grant ? <div className={dialogFooter}>
           <label className="grid w-full gap-1.5 text-sm">{t('已核实的用户名', 'Verified username')}
@@ -327,14 +396,14 @@ export function SupportAdmin({ request, english }: { request: AdminRequest; engl
           <p className="m-0 w-full text-xs text-muted-foreground">{t('核实账号归属后才能授权。权限最长 15 分钟，且只可使用一次。', 'Verify ownership before granting access. The reset is valid for at most 15 minutes and works once.')}</p>
           <Button variant="outline" type="button" disabled={busy} onClick={() => { setGrant(false); setError(''); }}>{t('取消', 'Cancel')}</Button>
           <Button type="submit" disabled={busy || !username.trim() || expired}>{t('授权重置密码', 'Authorize password reset')}</Button>
+        </div> : expired ? <div className={dialogFooter}>
+          <p className="m-0 me-auto text-sm text-muted-foreground">{t('此会话已过期，无法回复。', 'This conversation has expired and cannot be replied to.')}</p>
         </div> : <div className={dialogFooter}>
           <label className="grid w-full gap-1.5 text-sm font-medium">{t('回复内容', 'Reply')}
-            <Textarea className="min-h-16 resize-none" value={message} maxLength={2000} disabled={expired} onChange={e => setMessage(e.target.value)}
+            <Textarea className="min-h-16 max-h-32 resize-none overflow-y-auto" rows={2} value={message} maxLength={2000} onChange={e => setMessage(e.target.value)}
               placeholder={t('输入发给该用户的回复…', 'Write a reply to this customer…')} />
           </label>
-          {!expired && thread.status !== 'resolved' && <Button variant="ghost" size="sm" type="button" disabled={busy} onClick={() => void resolveThread()}>{t('标为已解决', 'Mark as resolved')}</Button>}
-          <Button variant="outline" size="sm" type="button" disabled={busy || expired} onClick={() => { setUsername(thread.username ?? ''); setGrant(true); setError(''); }}>{t('协助重置密码', 'Help reset password')}</Button>
-          <Button type="submit" disabled={busy || !message.trim() || expired}><Send aria-hidden="true" />{t('发送回复', 'Send reply')}</Button>
+          <Button type="submit" disabled={busy || !message.trim()}><Send aria-hidden="true" />{t('发送回复', 'Send reply')}</Button>
         </div>}
       </form>
     </FormDialog>}
