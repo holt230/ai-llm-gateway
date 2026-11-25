@@ -2,6 +2,7 @@ import { useId } from 'react';
 import type { CustomerKey } from './customer-session';
 import { Button } from './components/ui/button';
 import { SelectField } from './components/ui/select-field';
+import { cn } from './components/ui/utils';
 
 export type TestKeySource = {
   keys: CustomerKey[];
@@ -16,17 +17,18 @@ export function eligibleTestKeys(source: TestKeySource, groups: string[] = []) {
   return source.keys.filter(key => key.secretAvailable && groups.includes(key.modelGroup));
 }
 
-export function SavedTestKey({ source, keys, selected, onSelect, disabled, t }: {
+export function SavedTestKey({ source, keys, selected, onSelect, disabled, t, className }: {
   source: TestKeySource;
   keys: CustomerKey[];
   selected: string;
   onSelect: (id: string) => void;
   disabled?: boolean;
   t: Labels;
+  className?: string;
 }) {
   const fieldId = useId();
   const label = t('API 密钥', 'API key');
-  return <div className="grid min-w-0 gap-1.5">
+  return <div className={cn('grid min-w-0 gap-1.5', className)}>
     <label htmlFor={fieldId} className="text-xs font-medium text-muted-foreground">{label}</label>
     <SelectField id={fieldId} aria-label={label} value={selected} onValueChange={onSelect} disabled={disabled || !keys.length}>
       {keys.length ? keys.map(key => <option key={key.id} value={key.id}>

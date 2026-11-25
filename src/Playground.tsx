@@ -315,9 +315,9 @@ export function Playground({
       </div>
 
       {/* Control Bar: Model + Key + Send CTA */}
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]">
+      <div className="grid gap-3 sm:grid-cols-2 sm:gap-y-1.5 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]">
         {/* Model Picker */}
-        <div className="grid gap-1.5">
+        <div className="grid min-w-0 gap-1.5 sm:col-start-1 sm:row-span-2 sm:row-start-1 sm:grid-rows-subgrid">
           <label className="text-xs font-medium text-muted-foreground">{t('选择测试模型', 'Select Model')}</label>
           <SelectField aria-label={t('选择测试模型', 'Select model')} value={currentModel} onValueChange={handleModelChange} disabled={busy}>
             {validModels.map((m) => (
@@ -329,8 +329,9 @@ export function Playground({
         </div>
 
         {keySource ? <SavedTestKey source={keySource} keys={keys} selected={selectedKey?.id || ''}
-          onSelect={setSelectedKeyId} disabled={busy} t={t} /> : (
-          <label className="grid min-w-0 gap-1.5 text-xs font-medium text-muted-foreground">
+          onSelect={setSelectedKeyId} disabled={busy} t={t}
+          className={`sm:col-start-2 sm:row-start-1 sm:grid-rows-subgrid ${keys.length ? 'sm:row-span-2' : 'sm:row-span-3'}`} /> : (
+          <label className="grid min-w-0 gap-1.5 text-xs font-medium text-muted-foreground sm:col-start-2 sm:row-span-2 sm:row-start-1 sm:grid-rows-subgrid">
             <span className="flex flex-wrap justify-between gap-1">
               {t('鉴权凭据 (API Key)', 'API key')}
               <span className="font-normal">{t('默认使用管理员会话', 'Admin session active')}</span>
@@ -341,19 +342,17 @@ export function Playground({
         )}
 
         {/* Send Button */}
-        <div className="flex items-end">
-          <Button
-            type="button"
-            variant="default"
-            size="lg"
-            className="w-full gap-2 px-6 font-medium sm:w-auto"
-            onClick={() => void executeRequest()}
-            disabled={busy || !currentModel || (!isAdmin && !selectedKey)}
-          >
-            <Send size={16} className={busy ? 'animate-pulse' : ''} />
-            {busy ? t('请求中…', 'Sending…') : t('发送请求', 'Send request')}
-          </Button>
-        </div>
+        <Button
+          type="button"
+          variant="default"
+          size="lg"
+          className="w-full gap-2 px-6 font-medium sm:col-span-2 sm:mt-1.5 sm:w-auto sm:justify-self-start lg:col-span-1 lg:col-start-3 lg:row-start-2 lg:mt-0 lg:h-full"
+          onClick={() => void executeRequest()}
+          disabled={busy || !currentModel || (!isAdmin && !selectedKey)}
+        >
+          <Send size={16} className={busy ? 'animate-pulse' : ''} />
+          {busy ? t('请求中…', 'Sending…') : t('发送请求', 'Send request')}
+        </Button>
       </div>
 
       {/* Main Workspace (Split Grid) */}
