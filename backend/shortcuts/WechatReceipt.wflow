@@ -74,7 +74,7 @@
 			<key>WFWorkflowActionParameters</key>
 			<dict>
 				<key>WFAskActionPrompt</key>
-				<string>输入用户在网站充值页生成的 12 位订单号。付款备注未填写时，请向用户索取网站订单号。</string>
+				<string>输入用户的完整网站订单号（新订单为 8 位数字，历史订单为 12 位字符）。付款备注未填写时，请向用户索取。</string>
 				<key>WFInputType</key>
 				<string>Text</string>
 				<key>UUID</key>

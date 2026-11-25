@@ -431,7 +431,7 @@ export function WalletAccount({
                         <div className="mt-2 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-background px-3 py-1.5 shadow-xs">
                           <div className="min-w-0">
                             <div className="text-[10px] text-muted-foreground">{t('网站订单号 (付款必填项)', 'Website Order ID (Required in payment)')}</div>
-                            <code className="font-mono text-sm font-bold tracking-wider text-foreground select-all">
+                            <code className="select-all font-mono text-lg font-bold tracking-wider text-foreground tabular-nums">
                               {order.id}
                             </code>
                           </div>

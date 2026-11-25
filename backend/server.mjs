@@ -8,7 +8,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import pg from 'pg';
 import { CNY_PRICES, OPENAI_STANDARD_REFERENCE, PRICE_DATE, normalizeCnyPrice, parseYuan, prepaidBudget, standardApiDiscount, usageCharge } from './cny-prices.mjs';
-import { CHECKOUT_CHANNEL, openWalletStore } from './manual-wallet.mjs';
+import { CHECKOUT_CHANNEL, isOrderId, openWalletStore } from './manual-wallet.mjs';
 import { supportSessionTtl } from './accounts.mjs';
 
 const SUPPORT_COOKIE = 'jl_support';
@@ -4010,7 +4010,7 @@ async function handleAdmin(req, res, url) {
     } else if (req.method === 'GET' && path === 'orders') {
       const orderId = (url.searchParams.get('id') || '').trim().toUpperCase();
       const filter = (url.searchParams.get('filter') || 'pending').trim().toLowerCase();
-      if (orderId && !/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400,'请输入完整的 12 位网站订单号');
+      if (orderId && !isOrderId(orderId)) throw httpError(400,'请输入正确的网站订单号');
       const serviceKeyNames = new Map((config.auth.internalApiKeys || [])
         .filter(key => key.role === 'service' && key.walletId)
         .map(key => [key.walletId, key.name]));
@@ -4022,7 +4022,7 @@ async function handleAdmin(req, res, url) {
       sendJson(res,200,{orders});
     } else if (req.method === 'DELETE' && path === 'orders') {
       const orderId = (url.searchParams.get('id') || '').trim().toUpperCase();
-      if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400,'请输入完整的 12 位网站订单号');
+      if (!isOrderId(orderId)) throw httpError(400,'请输入正确的网站订单号');
       if (await store.removeOrder(orderId,channel)) auditAdminAction(auth,'delete',channel,orderId,{});
       sendJson(res,200,{ok:true});
     } else if (req.method === 'POST' && path === 'confirm') {
@@ -4737,7 +4737,7 @@ async function handleAccount(req, res, path, searchParams) {
     (req.method === 'POST' && path.startsWith('/account-api/orders/') && path.endsWith('/cancel'))
   ) {
     const orderId = path.replace('/account-api/orders/', '').replace('/cancel', '').trim().toUpperCase();
-    if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400, '订单号格式不正确');
+    if (!isOrderId(orderId)) throw httpError(400, '订单号格式不正确');
     const result = await store.cancelOrder(owner, orderId);
     sendJson(res, 200, result);
   } else if (req.method === 'POST' && path === '/account-api/orders') {
@@ -4811,7 +4811,7 @@ async function handlePayments(req, res, path, searchParams) {
     if (!auth.ok) throw httpError(auth.status, auth.error);
     if (auth.key.role !== 'service' || !auth.key.prepaid) throw httpError(403, '请使用已启用预付费的业务 Key');
     const orderId = path.slice('/payments/orders/'.length).trim().toUpperCase();
-    if (!/^[A-F0-9]{12}$/.test(orderId)) throw httpError(400, '订单号格式不正确');
+    if (!isOrderId(orderId)) throw httpError(400, '订单号格式不正确');
     const result = await (await walletStore()).cancelOrder(auth.key.walletId, orderId);
     sendJson(res, 200, result);
     return;

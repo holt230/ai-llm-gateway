@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { accountStore, accountTables } from './accounts.mjs';
@@ -12,6 +12,22 @@ export const CHECKOUT_CHANNEL = 'wechat';
 const settingsTable = channel => channel === 'wechat' ? 'gateway_wechat_settings' : 'gateway_alipay_settings';
 const DAY_MS = 86_400_000;
 const BEIJING_OFFSET_MS = 8 * 3_600_000;
+
+// The last digit checks the seven-digit body using Luhn.
+function orderCheckDigit(body) {
+  let sum = 0;
+  for (let index = 0; index < body.length; index++) {
+    const digit = Number(body[index]);
+    const weighted = index % 2 === 0 ? digit * 2 : digit;
+    sum += weighted > 9 ? weighted - 9 : weighted;
+  }
+  return String((10 - sum % 10) % 10);
+}
+
+export function isOrderId(id) {
+  return /^[A-F0-9]{12}$/.test(id) ||
+    (/^[1-9]\d{7}$/.test(id) && orderCheckDigit(id.slice(0, -1)) === id.at(-1));
+}
 
 function readChargeDetail(detail) {
   try { return JSON.parse(detail) ?? {}; }
@@ -273,17 +289,18 @@ export async function openWalletStore(pool, file, space = 'default', userKeyCode
         await wallet(q, owner);
         const [pending] = await q(orders + ' AND fen IS NULL AND channel=? AND paid IS NULL', [space, owner, channel]);
         if (pending) return pending;
-        const id = randomBytes(6).toString('hex').toUpperCase();
         const created = now();
-        await q('INSERT INTO gateway_cny_order(id,space,owner,fen,created,channel) VALUES(?,?,?,?,?,?)', [
-          id,
-          space,
-          owner,
-          null,
-          created,
-          channel
-        ]);
-        return { id, fen: null, created, paid: null, channel };
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const body = String(randomInt(1_000_000, 10_000_000));
+          const id = body + orderCheckDigit(body);
+          const [inserted] = await q(
+            `INSERT INTO gateway_cny_order(id,space,owner,fen,created,channel) VALUES(?,?,?,NULL,?,?)
+             ON CONFLICT(id) DO NOTHING RETURNING id`,
+            [id, space, owner, created, channel]
+          );
+          if (inserted) return { id, fen: null, created, paid: null, channel };
+        }
+        throw paymentError(503, '暂时无法生成订单号，请重试');
       });
     },
     async confirm(channel, { orderId, amount, transactionId }) {
@@ -294,7 +311,7 @@ export async function openWalletStore(pool, file, space = 'default', userKeyCode
       const number = typeof transactionId === 'string' ? transactionId.trim() : '';
       const units = parseYuan(amount);
       const actualFen = units ? units / (YUAN / 100n) : 0n;
-      if (!/^[A-F0-9]{12}$/.test(id) || !/^\d{12,64}$/.test(number) || !units || actualFen > BigInt(MAX_TOPUP_FEN)) {
+      if (!isOrderId(id) || !/^\d{12,64}$/.test(number) || !units || actualFen > BigInt(MAX_TOPUP_FEN)) {
         throw paymentError(400, '请核对网站订单号、实收金额（元）和支付平台交易号');
       }
       // Legacy WeChat receipts are bare numbers. Keep the existing unique constraint and

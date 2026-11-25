@@ -211,6 +211,7 @@ try {
   const current = await order('legacy-test-key');
   assert.equal(current.channel, 'wechat');
   assert.equal(current.fen, null);
+  assert.match(current.id, /^[1-9]\d{7}$/);
   assert.notEqual(current.id, 'AAAAAAAA0002');
   assert.equal((await confirm(current.id, alipayReceipt, '5.90', legacyToken)).status, 403);
   assert.equal((await confirmAlipay(current.id, alipayReceipt)).status, 409);
@@ -616,6 +617,9 @@ try {
   assert.equal((await fetch(base + '/payments/wechat/qr')).status, 404);
   assert.equal((await api(channelPath + 'qr', admin)).status, 200);
   const evidence = { orderId: manualOrder.id, amount: '59.17', transactionId: '2026111922001400009876543210' };
+  const mistyped = manualOrder.id.slice(0, -1) + (Number(manualOrder.id.at(-1)) + 1) % 10;
+  assert.equal((await api(channelPath + 'orders?id=' + mistyped, admin)).status, 400);
+  assert.equal((await channelApi('confirm', 'POST', admin, { ...evidence, orderId: mistyped })).status, 400);
   assert.equal((await channelApi('confirm', 'POST', bob, evidence)).status, 403);
   assert.equal((await channelApi('confirm', 'POST', admin, { ...evidence, amount: '5.901' })).status, 400);
   const verified = await Promise.all([

@@ -324,7 +324,7 @@ function Reconciliation({ base, publicBaseUrl, english, channel }: { base: strin
           >
             <Input
               aria-label={t('网站订单号', 'Website order number')}
-              placeholder={t('输入完整网站订单号', 'Enter full 12-char order ID')}
+              placeholder={t('输入完整网站订单号', 'Enter full website order ID')}
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
