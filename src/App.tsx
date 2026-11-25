@@ -59,6 +59,9 @@ import { createContext, FormEvent, ReactNode, useContext, useEffect, useMemo, us
 
 import { writeClipboard } from './clipboard';
 import { WormholeOrbit } from './WormholeOrbit';
+import { HomePointerTrail } from './HomePointerTrail';
+import { HomeHeroBackground } from './HomeHeroBackground';
+import { LiquidGlass, LiquidGlassDefs } from './LiquidGlass';
 import { PaymentAdmin } from './AlipayAdmin';
 import { CnyPricingAdmin, GroupsAdmin, type ManagedGroup } from './OperationsAdmin';
 import { RequestLogs } from './RequestLogs';
@@ -1126,7 +1129,7 @@ function Header({
   const { language, setLanguage } = useI18n();
   const zh = language === 'zh';
   return (
-    <header className="sticky top-0 z-40 border-b border-border/80 bg-background/95 backdrop-blur-md">
+    <header className="sticky top-0 z-40 border-b border-black/[0.07] bg-[#faf9f6]/80 backdrop-blur-xl backdrop-saturate-180 shadow-[inset_0_-1px_0_rgba(255,255,255,0.75),0_8px_28px_-18px_rgba(17,24,39,0.16)]">
       <div className="mx-auto flex min-h-16 max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-2 sm:px-8">
       <a
         className="shrink-0 rounded-md focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring"
@@ -1287,6 +1290,7 @@ function HomePage({
   const [copiedCurl, setCopiedCurl] = useState(false);
   const [copyError, setCopyError] = useState('');
   const [pricingError, setPricingError] = useState(false);
+  const orbitAnchor = useRef<HTMLDivElement>(null);
   const [infoData, setInfoData] = useState<{
     prices?: Record<string, { standard?: { input: number; output: number; read?: number; write?: number | null } }>;
     usableModels?: string[];
@@ -1352,10 +1356,21 @@ function HomePage({
           ? '创建账号'
           : 'Create an account';
   return (
-    <main className="flex flex-1 flex-col min-w-0 bg-[var(--bg)]">
-      <section className="overflow-hidden bg-[var(--ink)] text-white">
-        <div className="mx-auto grid max-w-7xl items-center gap-8 px-4 py-14 sm:px-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,0.85fr)] lg:py-20">
+    <main className="relative flex flex-1 flex-col min-w-0 bg-[var(--bg)]">
+      <LiquidGlassDefs />
+      <HomePointerTrail />
+      <section className="relative isolate overflow-hidden bg-[#06080c] text-white">
+        <HomeHeroBackground orbitAnchor={orbitAnchor} />
+        <div className="relative z-10 mx-auto grid max-w-7xl items-center gap-8 px-4 py-14 sm:px-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,0.85fr)] lg:py-20">
           <div className="min-w-0">
+            <LiquidGlass
+              tone="dark"
+              interactive={false}
+              className="mb-4 inline-flex items-center gap-2 rounded-full px-3.5 py-1.5 text-xs font-medium text-white/90"
+            >
+              <span className="size-1.5 rounded-full bg-[#73c9cc] shadow-[0_0_8px_#73c9cc]" aria-hidden="true" />
+              <span>{zh ? '统一大模型网关 · 人民币按量计费' : 'Unified AI Gateway · CNY Pay-as-you-go'}</span>
+            </LiquidGlass>
             <h1 className="m-0 text-5xl leading-none font-semibold tracking-[-0.04em] sm:text-7xl">Wormhole AI</h1>
             <h2 className="m-0 mt-4 text-xl leading-snug font-medium text-white/90 sm:text-2xl">{zh ? '为你的应用接入 AI 模型' : 'Connect your app to AI models'}</h2>
             <p className="m-0 mt-3 max-w-[52ch] text-base leading-relaxed text-white/75">
@@ -1363,33 +1378,41 @@ function HomePage({
                 ? '用一个 API 地址访问已开放的模型。在工作台创建密钥、充值人民币余额，逐笔查看调用费用。'
                 : 'Access available models through one API. Create keys, fund your CNY wallet, and track what each request costs.'}
             </p>
-            <div className="mt-6 flex flex-wrap items-center gap-2">
+            <div className="mt-6 flex flex-wrap items-center gap-2.5">
               <Button
-                variant="default" className="bg-[#daf1e9] text-[#17342c] hover:bg-[#c5e8db]"
+                variant="default" className="bg-[#daf1e9] text-[#17342c] shadow-[0_10px_28px_-10px_rgba(115,201,204,0.48),inset_0_1px_0_rgba(255,255,255,0.85)] hover:bg-[#c5e8db]"
                 onClick={() => onNavigate(identity?.role === 'admin' ? 'console' : identity ? 'account' : 'register')}
               >
                 {action}
                 <ArrowRight size={17} />
               </Button>
-              <Button asChild variant="ghost" className="text-white hover:bg-white/10 hover:text-white">
+              <Button asChild variant="ghost" className="liquid-glass-btn-dark text-white hover:text-white">
                 <a href="#getting-started">{zh ? '接入指南' : 'Quickstart'}</a>
               </Button>
             </div>
-            <div className="mt-5 flex w-fit max-w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-white/15 bg-white/5 py-1 pe-1 ps-3 text-sm">
+            <LiquidGlass
+              tone="dark"
+              className="mt-5 flex w-fit max-w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-xl py-1.5 pe-1.5 ps-3.5 text-sm"
+            >
               <span className="text-white/65">Base URL</span>
-              <code className="min-w-0 wrap-anywhere text-white/90">{apiBase}</code>
-              <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 text-white hover:bg-white/10 hover:text-white" onClick={copyAddress} aria-label={zh ? '复制 API 地址' : 'Copy API address'}>
+              <code className="min-w-0 wrap-anywhere text-white/95">{apiBase}</code>
+              <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 rounded-lg text-white hover:bg-white/15 hover:text-white" onClick={copyAddress} aria-label={zh ? '复制 API 地址' : 'Copy API address'}>
                 {copied ? <Check size={16} /> : <Copy size={16} />}
               </Button>
-            </div>
+            </LiquidGlass>
             {copyError && <small role="status">{copyError}</small>}
           </div>
-          <div className="mx-auto w-full max-w-md lg:max-w-none"><WormholeOrbit /></div>
+          <div className="mx-auto w-full max-w-md lg:max-w-none"><WormholeOrbit anchor={orbitAnchor} /></div>
         </div>
       </section>
 
       {/* Promotional Model Matrix Section */}
-      <section id="pricing-matrix" className="border-b border-border/60 bg-muted/20 py-12 sm:py-16 scroll-mt-14">
+      <section id="pricing-matrix" className="relative isolate overflow-hidden border-b border-border/60 bg-muted/20 py-12 sm:py-16 scroll-mt-14">
+        <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden" aria-hidden="true">
+          <div className="absolute -top-24 left-[8%] h-72 w-72 rounded-full bg-[#73c9cc]/18 blur-3xl" />
+          <div className="absolute top-1/3 right-[6%] h-80 w-80 rounded-full bg-[#edad69]/18 blur-3xl" />
+          <div className="absolute -bottom-24 left-[42%] h-72 w-72 rounded-full bg-[#8f9fda]/14 blur-3xl" />
+        </div>
         <div className="mx-auto max-w-7xl px-4 sm:px-8">
           <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 mb-10">
             <div>
@@ -1403,17 +1426,19 @@ function HomePage({
               </p>
             </div>
             {hasComparison && comparison && <div className="flex items-center gap-2 shrink-0">
-              <span className="rounded-md bg-background px-3 py-1.5 text-xs text-muted-foreground border border-border/60">
+              <LiquidGlass tone="light" interactive={false} className="rounded-full px-3.5 py-1.5 text-xs font-medium text-muted-foreground">
                 {zh ? `比价基准：1 USD = ¥${comparison.usdCny}` : `Comparison FX: 1 USD = ¥${comparison.usdCny}`}
-              </span>
+              </LiquidGlass>
             </div>}
           </div>
 
-          {!activeModels.length && <p className="m-0 rounded-xl border border-border bg-card p-5 text-sm text-muted-foreground" role="status">
-            {pricingError ? (zh ? '暂时无法获取模型报价。' : 'Model prices are temporarily unavailable.')
-              : infoData ? (zh ? '暂无可用模型报价。' : 'No published model prices yet.')
-                : (zh ? '正在获取模型报价…' : 'Loading model prices…')}
-          </p>}
+          {!activeModels.length && (
+            <LiquidGlass tone="light" interactive={false} className="rounded-2xl p-5 text-sm text-muted-foreground" role="status">
+              {pricingError ? (zh ? '暂时无法获取模型报价。' : 'Model prices are temporarily unavailable.')
+                : infoData ? (zh ? '暂无可用模型报价。' : 'No published model prices yet.')
+                  : (zh ? '正在获取模型报价…' : 'Loading model prices…')}
+            </LiquidGlass>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
             {activeModels.map(({ model: m, price }) => {
               const compare = comparison?.models[m.id];
@@ -1423,17 +1448,18 @@ function HomePage({
               const discountLabel = compare ? `${low === high ? high : `${low}–${high}`}${zh ? ' 折' : '% of standard'}` : '';
 
               return (
-                <div
+                <LiquidGlass
                   key={m.id}
-                  className={`group relative flex flex-col justify-between rounded-2xl border p-5 transition-all duration-200 hover:-translate-y-1 hover:shadow-xl ${
+                  tone="light"
+                  className={`group flex flex-col justify-between rounded-2xl p-5 hover:-translate-y-1 ${
                     m.highlight
-                      ? 'border-primary/40 bg-card shadow-lg shadow-black/5 ring-1 ring-primary/20'
-                      : 'border-border/80 bg-card hover:border-border'
+                      ? 'ring-1 ring-[#2f746e]/25'
+                      : ''
                   }`}
                 >
                   {m.highlight && (
-                    <div className="absolute -top-3 right-5">
-                      <span className="inline-flex items-center gap-1 rounded-full bg-primary px-3 py-0.5 text-[11px] font-semibold text-primary-foreground shadow-sm">
+                    <div className="absolute -top-3 right-5 z-10">
+                      <span className="inline-flex items-center gap-1 rounded-full border border-white/40 bg-primary/92 px-3 py-0.5 text-[11px] font-semibold text-primary-foreground shadow-[0_6px_16px_-4px_rgba(17,24,39,0.35),inset_0_1px_0_rgba(255,255,255,0.35)] backdrop-blur-md">
                         <Sparkles size={11} />
                         {zh ? '热门推荐' : 'Popular'}
                       </span>
@@ -1450,7 +1476,7 @@ function HomePage({
                           {zh ? m.tagZh : m.tagEn}
                         </span>
                       </div>
-                      {discountLabel && <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-2.5 py-1 text-xs font-bold text-amber-800 dark:text-amber-300 border border-amber-500/30">
+                      {discountLabel && <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-500/35 bg-amber-500/15 px-2.5 py-1 text-xs font-bold text-amber-800 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] dark:text-amber-300">
                         <Zap size={12} className="fill-current text-amber-600 dark:text-amber-400" />
                         {discountLabel}
                       </span>}
@@ -1465,14 +1491,14 @@ function HomePage({
                       </p>
                       <div
                         role="tooltip"
-                        className="pointer-events-none absolute left-0 bottom-full mb-1.5 z-30 hidden w-max max-w-[280px] sm:max-w-[320px] rounded-lg border border-border/80 bg-popover/95 p-2.5 text-xs leading-relaxed text-popover-foreground shadow-lg backdrop-blur-xs group-hover/desc:block"
+                        className="pointer-events-none absolute left-0 bottom-full mb-1.5 z-30 hidden w-max max-w-[280px] sm:max-w-[320px] rounded-xl border border-white/75 bg-white/90 p-2.5 text-xs leading-relaxed text-popover-foreground shadow-xl backdrop-blur-xl group-hover/desc:block"
                       >
                         {zh ? m.descZh : m.descEn}
                       </div>
                     </div>
 
                     {/* Price comparison card */}
-                    <div className="mt-4 rounded-xl border border-border/60 bg-muted/40 p-3.5 space-y-2.5">
+                    <div className="mt-4 rounded-xl border border-white/75 bg-white/55 p-3.5 space-y-2.5 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.88),0_2px_8px_-4px_rgba(20,32,42,0.06)]">
                       <div className="flex items-center justify-between text-xs">
                         <span className="text-muted-foreground font-medium">{zh ? '输入价格 (1M)' : 'Input (1M)'}</span>
                         <div className="flex items-baseline gap-2">
@@ -1484,7 +1510,7 @@ function HomePage({
                           </span>
                         </div>
                       </div>
-                      <div className="h-px bg-border/40" />
+                      <div className="h-px bg-border/45" />
                       <div className="flex items-center justify-between text-xs">
                         <span className="text-muted-foreground font-medium">{zh ? '输出价格 (1M)' : 'Output (1M)'}</span>
                         <div className="flex items-baseline gap-2">
@@ -1500,10 +1526,14 @@ function HomePage({
 
                   </div>
 
-                  <div className="mt-5 pt-3 border-t border-border/50">
+                  <div className="mt-5 pt-3 border-t border-border/40">
                     <Button
                       variant={m.highlight ? 'default' : 'outline'}
-                      className="w-full text-xs font-semibold h-9 gap-1.5"
+                      className={`w-full text-xs font-semibold h-9 gap-1.5 ${
+                        m.highlight
+                          ? 'shadow-[0_8px_18px_-8px_rgba(17,24,39,0.45),inset_0_1px_0_rgba(255,255,255,0.22)]'
+                          : 'border-white/80 bg-white/65 backdrop-blur-md hover:bg-white/90 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]'
+                      }`}
                       onClick={() => onNavigate(identity?.role === 'admin' ? 'console' : identity ? 'account' : 'register')}
                     >
                       <span>
@@ -1518,13 +1548,17 @@ function HomePage({
                       <ArrowRight size={14} />
                     </Button>
                   </div>
-                </div>
+                </LiquidGlass>
               );
             })}
           </div>
         </div>
       </section>
-      <section id="getting-started" className="flex-1 mx-auto w-full max-w-7xl scroll-mt-20 px-4 py-10 sm:px-8 sm:py-14">
+      <section id="getting-started" className="relative isolate flex-1 mx-auto w-full max-w-7xl scroll-mt-20 px-4 py-10 sm:px-8 sm:py-14">
+        <div className="pointer-events-none absolute inset-x-0 top-8 -z-10 flex justify-between overflow-hidden px-8" aria-hidden="true">
+          <div className="h-56 w-56 rounded-full bg-[#73c9cc]/12 blur-3xl" />
+          <div className="h-56 w-56 rounded-full bg-[#edad69]/12 blur-3xl" />
+        </div>
         <h2 className="m-0 text-2xl font-semibold tracking-tight sm:text-3xl">{zh ? '从注册到第一次调用' : 'Make your first API call'}</h2>
         <ol className="m-0 mt-6 grid list-none gap-4 p-0 sm:grid-cols-3">
           {(zh
@@ -1546,15 +1580,17 @@ function HomePage({
               ]
           ).map(([title, body], index) => (
             <li key={title}>
-              <Card className="grid h-full content-start gap-2 p-4 sm:p-5">
-                <span className="text-xs font-semibold text-[var(--accent-2)] tabular-nums" aria-hidden="true">0{index + 1}</span>
+              <LiquidGlass tone="light" className="grid h-full content-start gap-2 rounded-2xl p-4 sm:p-5 hover:-translate-y-0.5">
+                <span className="inline-flex w-fit items-center rounded-full border border-[#346267]/20 bg-[#346267]/10 px-2.5 py-0.5 text-xs font-semibold text-[var(--accent-2)] tabular-nums" aria-hidden="true">
+                  0{index + 1}
+                </span>
                 <h3 className="m-0 text-base font-semibold">{title}</h3>
                 <p className="m-0 text-sm leading-relaxed text-muted-foreground">{body}</p>
-              </Card>
+              </LiquidGlass>
             </li>
           ))}
         </ol>
-        <Card className="mt-6 grid gap-4 p-4 sm:p-5 lg:grid-cols-[minmax(0,0.5fr)_minmax(0,1fr)] lg:items-center">
+        <LiquidGlass tone="light" className="mt-6 grid gap-4 rounded-2xl p-4 sm:p-5 lg:grid-cols-[minmax(0,0.5fr)_minmax(0,1fr)] lg:items-center">
           <div>
             <h3 className="m-0 text-base font-semibold">{zh ? '查询可用模型' : 'List available models'}</h3>
             <p className="m-0 mt-1 text-sm text-muted-foreground">
@@ -1563,7 +1599,7 @@ function HomePage({
                 : 'Set WORMHOLE_API_KEY to a key created in your workspace.'}
             </p>
           </div>
-          <div className="flex items-center justify-between gap-3 overflow-hidden rounded-lg bg-[var(--ink)] p-3 pe-2 text-sm text-white sm:p-4 sm:pe-3">
+          <LiquidGlass tone="obsidian" className="flex items-center justify-between gap-3 overflow-hidden rounded-xl p-3 pe-2 text-sm text-white sm:p-4 sm:pe-3">
             <pre className="m-0 min-w-0 flex-1 overflow-x-auto font-mono text-xs text-[#a7f3d0] sm:text-sm">
               <code className="text-[#a7f3d0]">{curlCommand}</code>
             </pre>
@@ -1571,14 +1607,14 @@ function HomePage({
               type="button"
               variant="ghost"
               size="icon-sm"
-              className="shrink-0 text-white/80 hover:bg-white/10 hover:text-white"
+              className="shrink-0 rounded-lg text-white/80 hover:bg-white/15 hover:text-white"
               onClick={copyCurl}
               aria-label={zh ? '复制调用命令' : 'Copy command'}
             >
               {copiedCurl ? <Check size={16} /> : <Copy size={16} />}
             </Button>
-          </div>
-        </Card>
+          </LiquidGlass>
+        </LiquidGlass>
       </section>
     </main>
   );
